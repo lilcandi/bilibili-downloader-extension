@@ -1,0 +1,34 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.bilibili.com/"
+        }
+      ]
+    },
+    "condition": {
+      "requestDomains": ["bilivideo.com", "bilivideo.cn", "akamaized.net"],
+      "resourceTypes": [
+        "xmlhttprequest",
+        "other",
+        "media",
+        "sub_frame",
+        "main_frame",
+        "image",
+        "object",
+        "script",
+        "stylesheet",
+        "font",
+        "websocket",
+        "ping",
+        "csp_report"
+      ]
+    }
+  }
+]

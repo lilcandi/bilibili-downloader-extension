@@ -1,0 +1,6 @@
+# Chrome 加载未打包扩展时生成的目录
+_metadata/
+
+# 系统文件
+.DS_Store
+Thumbs.db
