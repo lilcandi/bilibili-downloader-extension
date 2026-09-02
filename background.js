@@ -17,6 +17,19 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         });
         return true;
     }
+    if (request.type === 'SAVE_TEXT' && request.filename && request.base64) {
+        // 字幕/弹幕等文本内容：base64 转 data URL 保存（UTF-8 已在 content 侧编码）
+        const url = 'data:application/octet-stream;base64,' + request.base64;
+        chrome.downloads.download({ url, filename: request.filename, saveAs: false }, id => {
+            if (chrome.runtime.lastError || id === undefined) {
+                console.warn('[B站下载助手] 文本保存失败:', chrome.runtime.lastError?.message, request.filename);
+                sendResponse({ ok: false, error: chrome.runtime.lastError?.message || '保存失败' });
+            } else {
+                sendResponse({ ok: true });
+            }
+        });
+        return true;
+    }
 });
 
 // MV3 下 SW 空闲约 30 秒会被杀掉，异步注册的监听器会随 Promise 链一起丢失。

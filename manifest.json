@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Bilibili 高画质下载助手",
-  "version": "1.2.1",
-  "description": "在视频工具栏旁一键下载B站视频：画质选择、浏览器内自动合并（无需ffmpeg），大会员可下 1080P+/4K。",
+  "version": "1.3.0",
+  "description": "在视频工具栏旁一键下载B站视频：画质选择、浏览器内自动合并（无需ffmpeg），大会员可下 1080P+/4K，支持同时保存字幕和弹幕。",
   "permissions": [
     "downloads",
     "storage",
