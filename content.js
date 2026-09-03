@@ -72,6 +72,25 @@
             border-left: 1px solid rgba(255,255,255,.4);
         }
         #${BTN_ID} .bili-dl-ext-arrow:hover { background: rgba(0,0,0,.12); }
+        /* 抖音右侧操作栏样式：白色竖排图标+文字，与点赞/评论/分享对齐 */
+        #${BTN_ID}.bili-dl-ext-douyin {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            height: auto;
+            margin: 6px 0;
+            padding: 0;
+            background: transparent;
+            border-radius: 0;
+            overflow: visible;
+            color: #fff;
+            font-size: 14px;
+            white-space: nowrap;
+        }
+        #${BTN_ID}.bili-dl-ext-douyin:hover { background: transparent; opacity: .85; }
+        #${BTN_ID}.bili-dl-ext-douyin svg { width: 30px; height: 30px; fill: #fff; }
         #bili-dl-ext-float {
             position: fixed;
             right: 24px;
@@ -215,17 +234,39 @@
         );
     }
 
+    // 抖音右侧操作栏的“分享”项：data-e2e 锚点稳定，但类名混淆，
+    // 从锚点向上找到"含多个子项的操作项容器"（与点赞/评论/收藏同级的兄弟）
+    function findDouyinShareItem() {
+        const icon = document.querySelector('[data-e2e="share-icon"]');
+        if (!icon) return null;
+        let el = icon;
+        for (let i = 0; i < 6 && el.parentElement; i++) {
+            el = el.parentElement;
+            if (el.children.length >= 2) return el;
+        }
+        return icon;
+    }
+
     function createButton() {
         const btn = document.createElement('button');
         btn.id = BTN_ID;
         btn.type = 'button';
-        btn.title = '下载当前视频\n点击：按上次画质下载（默认最高）\n点右侧箭头：选择画质';
-        btn.innerHTML = `
-            <span class="bili-dl-ext-main">
+        if (PLATFORM === 'douyin') {
+            // 抖音：竖排白色图标按钮，与点赞/评论/分享同列同风格
+            btn.classList.add('bili-dl-ext-douyin');
+            btn.title = '下载当前视频（原画 MP4）';
+            btn.innerHTML = `
                 <svg viewBox="0 0 24 24"><path d="M12 3a1 1 0 0 1 1 1v9.59l3.3-3.3a1 1 0 1 1 1.4 1.42l-5 5a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.42l3.3 3.3V4a1 1 0 0 1 1-1zM5 19a1 1 0 0 1 1-1h12a1 1 0 1 1 0 2H6a1 1 0 0 1-1-1z"/></svg>
-                <span class="bili-dl-ext-text">下载</span>
-            </span>
-            <span class="bili-dl-ext-arrow" title="选择画质">▼</span>`;
+                <span class="bili-dl-ext-text">下载</span>`;
+        } else {
+            btn.title = '下载当前视频\n点击：按上次画质下载（默认最高）\n点右侧箭头：选择画质';
+            btn.innerHTML = `
+                <span class="bili-dl-ext-main">
+                    <svg viewBox="0 0 24 24"><path d="M12 3a1 1 0 0 1 1 1v9.59l3.3-3.3a1 1 0 1 1 1.4 1.42l-5 5a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.42l3.3 3.3V4a1 1 0 0 1 1-1zM5 19a1 1 0 0 1 1-1h12a1 1 0 1 1 0 2H6a1 1 0 0 1-1-1z"/></svg>
+                    <span class="bili-dl-ext-text">下载</span>
+                </span>
+                <span class="bili-dl-ext-arrow" title="选择画质">▼</span>`;
+        }
         btn.addEventListener('click', e => {
             if (e.target.closest('.bili-dl-ext-arrow')) {
                 e.preventDefault();
@@ -243,9 +284,15 @@
         injectStyle();
         if (document.getElementById(BTN_ID)) return;
 
-        // 抖音页 DOM 结构不稳定，统一走右下角浮动素材钮（可复用 onMainClick 分发）
+        // 抖音：优先插入右侧操作栏（分享按钮旁，与点赞/评论/收藏同列）
         if (PLATFORM === 'douyin') {
-            showFloatFallback();
+            const anchor = findDouyinShareItem();
+            if (anchor) {
+                anchor.insertAdjacentElement('afterend', createButton());
+                console.log(TAG, '已注入按钮到抖音右侧操作栏');
+            } else {
+                showFloatFallback(); // 操作栏未渲染时兜底
+            }
             return;
         }
 
