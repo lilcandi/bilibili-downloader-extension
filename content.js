@@ -15,8 +15,22 @@
 
     const BTN_ID = 'bili-dl-ext-btn';
     const PANEL_ID = 'bili-dl-ext-panel';
-    const TAG = '[B站下载助手]';
+    const TAG = '[b抖下载器]';
     const LS_KEY = 'biliDlExtQuality';
+
+    // ---------- 平台识别：B站 / 抖音 ----------
+    function isBiliPage() {
+        return /bilibili\.com$/.test(location.hostname) && /\/video\/[a-zA-Z0-9]+/.test(location.pathname);
+    }
+    function isDouyinPage() {
+        return /(^|\.)douyin\.com$/.test(location.hostname) && isDouyinVideo();
+    }
+    function isDouyinVideo() {
+        return /\/video\/\d+/.test(location.pathname) ||
+               /\/note\/\d+/.test(location.pathname) ||
+               /modal_id=\d+/.test(location.search);
+    }
+    const PLATFORM = isBiliPage() ? 'bili' : isDouyinPage() ? 'douyin' : 'none';
 
     const CSS = `
         #${BTN_ID} {
@@ -167,7 +181,7 @@
     }
 
     function isVideoPage() {
-        return /\/video\/(BV[\w]+|av\d+)/.test(location.pathname);
+        return isBiliPage() || isDouyinPage();
     }
 
     // 定位“转发”按钮：类名优先，文本匹配兜底
@@ -228,6 +242,12 @@
         if (!isVideoPage()) return;
         injectStyle();
         if (document.getElementById(BTN_ID)) return;
+
+        // 抖音页 DOM 结构不稳定，统一走右下角浮动素材钮（可复用 onMainClick 分发）
+        if (PLATFORM === 'douyin') {
+            showFloatFallback();
+            return;
+        }
 
         const share = findShareButton();
         if (share) {
@@ -397,6 +417,12 @@
         const btn = e.currentTarget;
         closePanel();
         await withStatus(btn, async label => {
+            // 抖音：直接下载原画 MP4（免合并、无字幕/弹幕）
+            if (PLATFORM === 'douyin') {
+                const info = await getDouyinInfo();
+                await downloadDouyin(info, label);
+                return;
+            }
             const info = await getPlayInfo();
             const ids = [...info.videoMap.keys()].sort((a, b) => b - a);
             if (!ids.length) return downloadMp4(info, label);
@@ -596,6 +622,83 @@
         }
     }
 
+    // ---------- 抖音：解析 + 下载（单文件 MP4，无需合并） ----------
+
+    // 递归收集页面嵌入式数据中的 play_addr（每个含 url_list 数组）
+    function collectDouyinPlayAddrs(obj) {
+        const out = [];
+        (function walk(o) {
+            if (!o) return;
+            if (Array.isArray(o)) { o.forEach(walk); return; }
+            if (typeof o === 'object') {
+                if (o.play_addr && Array.isArray(o.play_addr.url_list) && o.play_addr.url_list.length) {
+                    out.push(o.play_addr);
+                }
+                Object.keys(o).forEach(k => walk(o[k]));
+            }
+        })(obj);
+        return out;
+    }
+
+    function absoluteUrl(u) {
+        if (!u) return '';
+        return u.startsWith('//') ? 'https:' + u : u;
+    }
+
+    function getDouyinTitle() {
+        const og = document.querySelector('meta[property="og:title"]')?.content;
+        if (og && og.trim()) return og.trim();
+        const t = document.title.replace(/\s*[-–—_].*$/, '').trim();
+        return t || 'douyin_video';
+    }
+
+    async function getDouyinInfo() {
+        const urls = [];
+        const title = getDouyinTitle();
+
+        // 策略1：<script id="RENDER_DATA">（URL 编码的 SSR JSON，含 aweme_detail.video.play_addr）
+        const render = document.querySelector('script#RENDER_DATA');
+        if (render && render.textContent) {
+            try {
+                const data = JSON.parse(decodeURIComponent(render.textContent));
+                collectDouyinPlayAddrs(data).forEach(pa =>
+                    pa.url_list.forEach(u => { const a = absoluteUrl(u); if (a && !urls.includes(a)) urls.push(a); })
+                );
+            } catch (e) {
+                console.warn(TAG, '抖音源码解析失败:', e.message);
+            }
+        }
+
+        // 策略2：页面上已加载的 <video> 元素真实地址
+        if (!urls.length) {
+            const v = document.querySelector('video');
+            const src = (v && (v.currentSrc || v.src)) || '';
+            if (src.startsWith('http')) urls.push(src);
+        }
+
+        // 策略3：全页面脚本中匹配 "playAddr":[...] 里的 http 地址（处理 \u002f 转义）
+        if (!urls.length) {
+            document.querySelectorAll('script').forEach(s => {
+                const m = (s.textContent || '').match(/"playAddr"\s*:\s*\[([^\]]*)\]/);
+                if (!m) return;
+                m[1].match(/https?:\/\/[^"\\,\]]+|\\u002f\\u002f[^"\\,\]]+/g).forEach(u => {
+                    const a = u.startsWith('http') ? u : absoluteUrl('//' + u);
+                    const clean = a.replace(/\\u002f/g, '/');
+                    if (clean.startsWith('http') && !urls.includes(clean)) urls.push(clean);
+                });
+            });
+        }
+
+        if (!urls.length) throw new Error('未能获取视频播放地址，请等待页面加载完成后再试');
+        return { title, urls };
+    }
+
+    async function downloadDouyin(info, label) {
+        const name = sanitize(info.title) + '.mp4';
+        await sendDownload(info.urls, name);
+        label.textContent = '已开始下载抖音视频 ✓';
+    }
+
     // ---------- 画质选择面板 ----------
 
     function togglePanel(btn) {
@@ -613,7 +716,7 @@
 
         let info;
         try {
-            info = await getPlayInfo();
+            info = PLATFORM === 'douyin' ? await getDouyinInfo() : await getPlayInfo();
         } catch (err) {
             console.error(TAG, err);
             panel.innerHTML = `<div class="bili-dl-ext-panel-loading">获取失败：${err.message}</div>`;
@@ -621,6 +724,26 @@
             return;
         }
         if (!document.getElementById(PANEL_ID)) return; // 面板已被关闭
+
+        // 抖音面板：单文件 MP4，无画质列表/字幕/弹幕
+        if (PLATFORM === 'douyin') {
+            panel.innerHTML = `
+                <div class="bili-dl-ext-panel-title">抖音下载</div>
+                <div class="bili-dl-ext-opt active" data-key="douyin-main">
+                    <span class="bili-dl-ext-qlabel">视频 MP4（原画）</span>
+                    <span class="bili-dl-ext-qbadge">单文件</span>
+                </div>
+                <div class="bili-dl-ext-panel-tip">抖音视频为单文件 MP4，直接保存到下载目录。若获取失败请刷新页面重试。</div>`;
+            positionPanel(panel, btn);
+            panel.addEventListener('click', e => {
+                const opt = e.target.closest('.bili-dl-ext-opt');
+                if (!opt) return;
+                closePanel();
+                withStatus(btn, async label => { await downloadDouyin(info, label); });
+            });
+            bindPanelDismiss(panel);
+            return;
+        }
 
         const ids = [...info.videoMap.keys()].sort((a, b) => b - a);
         const saved = getSavedChoice();
@@ -705,6 +828,24 @@
         if (!panel) return;
         panel._cleanup?.();
         panel.remove();
+    }
+
+    // 面板关闭监听：外部点击 / 滚动 / Esc
+    function bindPanelDismiss(panel) {
+        setTimeout(() => {
+            document.addEventListener('pointerdown', onOutside, true);
+            document.addEventListener('scroll', closePanel, true);
+            document.addEventListener('keydown', onEsc, true);
+        });
+        function onOutside(e) {
+            if (!panel.contains(e.target) && !e.target.closest(`#${BTN_ID}`)) closePanel();
+        }
+        function onEsc(e) { if (e.key === 'Escape') closePanel(); }
+        panel._cleanup = () => {
+            document.removeEventListener('pointerdown', onOutside, true);
+            document.removeEventListener('scroll', closePanel, true);
+            document.removeEventListener('keydown', onEsc, true);
+        };
     }
 
     // ---------- 浮动兜底按钮 ----------

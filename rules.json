@@ -30,5 +30,37 @@
         "csp_report"
       ]
     }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.douyin.com/"
+        }
+      ]
+    },
+    "condition": {
+      "requestDomains": ["douyinvod.com", "douyinpic.com", "snssdk.com", "amemv.com", "bytecdntp.com"],
+      "resourceTypes": [
+        "xmlhttprequest",
+        "other",
+        "media",
+        "sub_frame",
+        "main_frame",
+        "image",
+        "object",
+        "script",
+        "stylesheet",
+        "font",
+        "websocket",
+        "ping",
+        "csp_report"
+      ]
+    }
   }
 ]
