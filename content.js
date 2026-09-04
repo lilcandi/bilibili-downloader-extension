@@ -30,7 +30,13 @@
                /\/note\/\d+/.test(location.pathname) ||
                /modal_id=\d+/.test(location.search);
     }
-    const PLATFORM = isBiliPage() ? 'bili' : isDouyinPage() ? 'douyin' : 'none';
+    // 按当前 URL 动态判断：抖音是 SPA，从首页/用户页点开视频只变地址不重载页面，
+    // 脚本加载时的路径可能还不是视频页，不能在加载时把平台固定下来
+    function getPlatform() {
+        if (isBiliPage()) return 'bili';
+        if (isDouyinPage()) return 'douyin';
+        return 'none';
+    }
 
     const CSS = `
         #${BTN_ID} {
@@ -79,6 +85,8 @@
             align-items: center;
             justify-content: center;
             gap: 6px;
+            min-width: 44px;
+            min-height: 56px;
             height: auto;
             margin: 6px 0;
             padding: 0;
@@ -88,6 +96,8 @@
             color: #fff;
             font-size: 14px;
             white-space: nowrap;
+            visibility: visible;
+            opacity: 1;
         }
         #${BTN_ID}.bili-dl-ext-douyin:hover { background: transparent; opacity: .85; }
         #${BTN_ID}.bili-dl-ext-douyin svg { width: 30px; height: 30px; fill: #fff; }
@@ -234,24 +244,55 @@
         );
     }
 
-    // 抖音右侧操作栏的“分享”项：data-e2e 锚点稳定，但类名混淆，
-    // 从锚点向上找到"含多个子项的操作项容器"（与点赞/评论/收藏同级的兄弟）
-    function findDouyinShareItem() {
-        const icon = document.querySelector('[data-e2e="share-icon"]');
-        if (!icon) return null;
-        let el = icon;
-        for (let i = 0; i < 6 && el.parentElement; i++) {
-            el = el.parentElement;
-            if (el.children.length >= 2) return el;
+    // 元素可见性：rect 非零 + 祖先链上无 display:none/visibility:hidden
+    // （抖音页面常驻整套隐藏的旧版播放器 DOM，querySelector 极易命中不可见副本）
+    function isVisibleEl(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        for (let p = el; p && p !== document.documentElement; p = p.parentElement) {
+            const s = getComputedStyle(p);
+            if (s.display === 'none' || s.visibility === 'hidden') return false;
         }
-        return icon;
+        return true;
+    }
+
+    // 抖音操作栏锚点：改版多次（横向操作栏 video-share-icon-container /
+    // 竖排侧栏 video-player-share / 更旧的 share-icon / digg-icon 等）。
+    // 同名锚点可能同时存在可见与隐藏两套副本，必须选可见的那个
+    const DOUYIN_ANCHOR_KEYS = [
+        'video-share-icon-container',
+        'video-player-share',
+        'share-icon',
+        'video-player-collect',
+        'collect-icon',
+        'video-player-digg',
+        'digg-icon',
+        'feed-comment-icon',
+        'comment-icon'
+    ];
+
+    // 找到可见锚点后向上定位"含多个子项的操作项容器"（与点赞/评论/分享同级）
+    function findDouyinAnchor() {
+        for (const key of DOUYIN_ANCHOR_KEYS) {
+            for (const icon of document.querySelectorAll(`[data-e2e="${key}"]`)) {
+                if (!isVisibleEl(icon)) continue;
+                let el = icon;
+                for (let i = 0; i < 6 && el.parentElement; i++) {
+                    el = el.parentElement;
+                    if (el.children.length >= 2 && isVisibleEl(el)) return el;
+                }
+                return icon;
+            }
+        }
+        return null;
     }
 
     function createButton() {
         const btn = document.createElement('button');
         btn.id = BTN_ID;
         btn.type = 'button';
-        if (PLATFORM === 'douyin') {
+        if (getPlatform() === 'douyin') {
             // 抖音：竖排白色图标按钮，与点赞/评论/分享同列同风格
             btn.classList.add('bili-dl-ext-douyin');
             btn.title = '下载当前视频（原画 MP4）';
@@ -284,12 +325,21 @@
         injectStyle();
         if (document.getElementById(BTN_ID)) return;
 
-        // 抖音：优先插入右侧操作栏（分享按钮旁，与点赞/评论/收藏同列）
-        if (PLATFORM === 'douyin') {
-            const anchor = findDouyinShareItem();
+        // 抖音：优先插入操作栏（分享按钮旁，与点赞/评论/收藏同行/同列）
+        if (getPlatform() === 'douyin') {
+            const anchor = findDouyinAnchor();
             if (anchor) {
-                anchor.insertAdjacentElement('afterend', createButton());
-                console.log(TAG, '已注入按钮到抖音右侧操作栏');
+                const btn = createButton();
+                anchor.insertAdjacentElement('afterend', btn);
+                // 注入后校验：若命中隐藏副本（按钮 0×0）则撤掉，换浮动兜底
+                if (!isVisibleEl(btn)) {
+                    btn.remove();
+                    console.warn(TAG, '锚点不可见（隐藏副本），使用浮动兜底按钮');
+                    showFloatFallback();
+                } else {
+                    document.getElementById('bili-dl-ext-float')?.remove(); // 操作栏已渲染，撤掉浮动兜底
+                    console.log(TAG, '已注入按钮到抖音操作栏');
+                }
             } else {
                 showFloatFallback(); // 操作栏未渲染时兜底
             }
@@ -306,7 +356,9 @@
         if (toolbar) {
             toolbar.appendChild(createButton());
             console.log(TAG, '已注入按钮到工具栏容器');
+            return;
         }
+        showFloatFallback(); // 工具栏定位失败（B站改版等）时兜底
     }
 
     // ---------- 数据获取（页面环境，带登录 Cookie） ----------
@@ -465,7 +517,7 @@
         closePanel();
         await withStatus(btn, async label => {
             // 抖音：直接下载原画 MP4（免合并、无字幕/弹幕）
-            if (PLATFORM === 'douyin') {
+            if (getPlatform() === 'douyin') {
                 const info = await getDouyinInfo();
                 await downloadDouyin(info, label);
                 return;
@@ -636,7 +688,11 @@
         if (!url) throw new Error('字幕地址为空');
         if (url.startsWith('//')) url = 'https:' + url;
 
-        const sub = await fetchJson(url);
+        // 字幕 CDN 返回的是裸 JSON（{body:[...]}），没有 code/data 包装，不能用 fetchJson
+        const resp = await fetch(url, { credentials: 'include' });
+        if (!resp.ok) throw new Error('字幕接口 HTTP ' + resp.status);
+        const raw = await resp.json();
+        const sub = raw?.body ? raw : raw?.data;
         if (!sub?.body?.length) throw new Error('字幕内容为空');
         await saveTextFile(subtitleToSrt(sub.body), `${baseNameNoLabel}.srt`);
         console.log(TAG, `字幕已保存：${zh.lan_doc}，共 ${sub.body.length} 条`);
@@ -703,6 +759,21 @@
         const urls = [];
         const title = getDouyinTitle();
 
+        // 策略0：后台 webRequest 捕获的本页真实播放直链（最可靠）。
+        // 抖音页面是客户端渲染，RENDER_DATA 可能缺失、<video> 的 src 常为 blob:，
+        // 脚本里不一定有 playAddr；浏览器实际拉流过的地址对 SPA/未登录全部免疫
+        try {
+            const resp = await new Promise((resolve, reject) => {
+                chrome.runtime.sendMessage({ type: 'GET_DOUYIN_STREAMS' }, resp => {
+                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    resolve(resp);
+                });
+            });
+            (resp?.urls || []).forEach(u => { if (!urls.includes(u)) urls.push(u); });
+        } catch (e) {
+            console.warn(TAG, '播放流捕获不可用:', e.message);
+        }
+
         // 策略1：<script id="RENDER_DATA">（URL 编码的 SSR JSON，含 aweme_detail.video.play_addr）
         const render = document.querySelector('script#RENDER_DATA');
         if (render && render.textContent) {
@@ -723,20 +794,25 @@
             if (src.startsWith('http')) urls.push(src);
         }
 
-        // 策略3：全页面脚本中匹配 "playAddr":[...] 里的 http 地址（处理 \u002f 转义）
+        // 策略3：全页面脚本中匹配 "playAddr":[...] 里的 http 地址。
+        // JSON 里斜杠常被转义为 \/ 或 \u002f，先还原再匹配，否则会截断/拼出无效地址
         if (!urls.length) {
             document.querySelectorAll('script').forEach(s => {
                 const m = (s.textContent || '').match(/"playAddr"\s*:\s*\[([^\]]*)\]/);
                 if (!m) return;
-                m[1].match(/https?:\/\/[^"\\,\]]+|\\u002f\\u002f[^"\\,\]]+/g).forEach(u => {
-                    const a = u.startsWith('http') ? u : absoluteUrl('//' + u);
-                    const clean = a.replace(/\\u002f/g, '/');
-                    if (clean.startsWith('http') && !urls.includes(clean)) urls.push(clean);
+                const plain = m[1]
+                    .replace(/\\u002[fF]/g, '/')
+                    .replace(/\\u0026/gi, '&')
+                    .replace(/\\\//g, '/');
+                plain.split(',').forEach(part => {
+                    let u = part.replace(/"/g, '').trim();
+                    if (u.startsWith('//')) u = 'https:' + u;
+                    if (u.startsWith('http') && !urls.includes(u)) urls.push(u);
                 });
             });
         }
 
-        if (!urls.length) throw new Error('未能获取视频播放地址，请等待页面加载完成后再试');
+        if (!urls.length) throw new Error('未能获取视频播放地址，请先播放视频几秒后再试（首次播放后扩展即可捕获直链）');
         return { title, urls };
     }
 
@@ -763,7 +839,7 @@
 
         let info;
         try {
-            info = PLATFORM === 'douyin' ? await getDouyinInfo() : await getPlayInfo();
+            info = getPlatform() === 'douyin' ? await getDouyinInfo() : await getPlayInfo();
         } catch (err) {
             console.error(TAG, err);
             panel.innerHTML = `<div class="bili-dl-ext-panel-loading">获取失败：${err.message}</div>`;
@@ -773,7 +849,7 @@
         if (!document.getElementById(PANEL_ID)) return; // 面板已被关闭
 
         // 抖音面板：单文件 MP4，无画质列表/字幕/弹幕
-        if (PLATFORM === 'douyin') {
+        if (getPlatform() === 'douyin') {
             panel.innerHTML = `
                 <div class="bili-dl-ext-panel-title">抖音下载</div>
                 <div class="bili-dl-ext-opt active" data-key="douyin-main">
@@ -941,6 +1017,11 @@
         observer.observe(document.body, { childList: true, subtree: true });
         console.log(TAG, '内容脚本已加载 v' + chrome.runtime.getManifest().version + ':', location.href);
         injectButton();
+        // 兜底轮询：抖音操作栏可能延迟很久才渲染（实测可达 1 分钟以上），
+        // 且期间 DOM 可能停止变动导致 MutationObserver 不再触发，定时重试保证真实按钮最终注入
+        setInterval(() => {
+            if (!document.getElementById(BTN_ID)) injectButton();
+        }, 3000);
         setTimeout(() => {
             if (!document.getElementById(BTN_ID)) showFloatFallback();
         }, 8000);

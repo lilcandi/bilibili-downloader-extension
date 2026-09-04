@@ -173,12 +173,22 @@
         const blobUrl = URL.createObjectURL(new Blob([merged.buffer], { type: 'video/mp4' }));
         await new Promise((resolve, reject) => {
             chrome.downloads.download({ url: blobUrl, filename: job.filename, saveAs: false }, id => {
-                URL.revokeObjectURL(blobUrl); // 下载已被浏览器接管，释放 blob 内存
                 if (chrome.runtime.lastError || id === undefined) {
+                    URL.revokeObjectURL(blobUrl);
                     reject(new Error(chrome.runtime.lastError?.message || '保存失败'));
-                } else {
-                    resolve(id);
+                    return;
                 }
+                // 回调仅表示下载已启动；此时 blob 仍被浏览器读取，立即 revoke 会中断
+                // 大文件下载。等下载进入终态再释放。
+                const onChanged = delta => {
+                    if (delta.id !== id || !delta.state) return;
+                    if (delta.state.current === 'complete' || delta.state.current === 'interrupted') {
+                        chrome.downloads.onChanged.removeListener(onChanged);
+                        URL.revokeObjectURL(blobUrl);
+                    }
+                };
+                chrome.downloads.onChanged.addListener(onChanged);
+                resolve(id);
             });
         });
         setStep('save', 'done', '已保存到下载目录', 1);

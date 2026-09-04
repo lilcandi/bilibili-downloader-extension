@@ -2,7 +2,7 @@
 
 Last updated: 2026-09-03
 
-"Bilibili 高画质下载助手" (Bilibili High-Quality Download Assistant) is a browser extension that helps users download videos they have permission to watch on bilibili.com, for personal offline viewing.
+"b抖下载器" (bDou Downloader) is a browser extension that helps users download videos they have permission to watch on bilibili.com and douyin.com, for personal offline viewing.
 
 ## What data we collect
 

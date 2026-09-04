@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "b抖下载器",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "一键下载B站与抖音视频：B站支持画质选择、浏览器内自动合并、字幕和弹幕保存；抖音直接下载原画 MP4。",
   "permissions": [
     "downloads",
     "storage",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "webRequest"
   ],
   "host_permissions": [
     "https://*.bilibili.com/*",
@@ -27,9 +28,7 @@
     {
       "matches": [
         "https://*.bilibili.com/video/*",
-        "https://www.douyin.com/video/*",
-        "https://www.douyin.com/note/*",
-        "https://www.douyin.com/user/*"
+        "https://www.douyin.com/*"
       ],
       "js": [
         "content.js"
