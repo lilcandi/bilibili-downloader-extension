@@ -23,12 +23,18 @@
         return /bilibili\.com$/.test(location.hostname) && /\/video\/[a-zA-Z0-9]+/.test(location.pathname);
     }
     function isDouyinPage() {
-        return /(^|\.)douyin\.com$/.test(location.hostname) && isDouyinVideo();
+        return /(^|\.)douyin\.com$/.test(location.hostname) && (isDouyinVideo() || isDouyinFeed());
     }
     function isDouyinVideo() {
         return /\/video\/\d+/.test(location.pathname) ||
                /\/note\/\d+/.test(location.pathname) ||
                /modal_id=\d+/.test(location.search);
+    }
+    // 沉浸式信息流页（推荐 /discover 等）：URL 不含 /video/，但每条视频有完整操作栏
+    function isDouyinFeed() {
+        return location.pathname === '/' ||
+               /^\/discover\b/.test(location.pathname) ||
+               /(^|[?&])recommend=1/.test(location.search);
     }
     // 按当前 URL 动态判断：抖音是 SPA，从首页/用户页点开视频只变地址不重载页面，
     // 脚本加载时的路径可能还不是视频页，不能在加载时把平台固定下来
@@ -273,9 +279,11 @@
     ];
 
     // 找到可见锚点后向上定位"含多个子项的操作项容器"（与点赞/评论/分享同级）
-    function findDouyinAnchor() {
+    // scope：信息流页传入 feed 项元素（只在该项内找，避免命中相邻视频的锚点）
+    function findDouyinAnchor(scope) {
+        const root = scope || document;
         for (const key of DOUYIN_ANCHOR_KEYS) {
-            for (const icon of document.querySelectorAll(`[data-e2e="${key}"]`)) {
+            for (const icon of root.querySelectorAll(`[data-e2e="${key}"]`)) {
                 if (!isVisibleEl(icon)) continue;
                 let el = icon;
                 for (let i = 0; i < 6 && el.parentElement; i++) {
@@ -323,28 +331,15 @@
     function injectButton() {
         if (!isVideoPage()) return;
         injectStyle();
-        if (document.getElementById(BTN_ID)) return;
 
-        // 抖音：优先插入操作栏（分享按钮旁，与点赞/评论/收藏同行/同列）
+        // 抖音：详情页单按钮；信息流页每个 feed 项的操作栏各一个按钮
+        // （上下滑切换视频后新项自带按钮；直播卡片项无视频数据，跳过）
         if (getPlatform() === 'douyin') {
-            const anchor = findDouyinAnchor();
-            if (anchor) {
-                const btn = createButton();
-                anchor.insertAdjacentElement('afterend', btn);
-                // 注入后校验：若命中隐藏副本（按钮 0×0）则撤掉，换浮动兜底
-                if (!isVisibleEl(btn)) {
-                    btn.remove();
-                    console.warn(TAG, '锚点不可见（隐藏副本），使用浮动兜底按钮');
-                    showFloatFallback();
-                } else {
-                    document.getElementById('bili-dl-ext-float')?.remove(); // 操作栏已渲染，撤掉浮动兜底
-                    console.log(TAG, '已注入按钮到抖音操作栏');
-                }
-            } else {
-                showFloatFallback(); // 操作栏未渲染时兜底
-            }
+            injectDouyin();
             return;
         }
+
+        if (document.getElementById(BTN_ID)) return;
 
         const share = findShareButton();
         if (share) {
@@ -359,6 +354,40 @@
             return;
         }
         showFloatFallback(); // 工具栏定位失败（B站改版等）时兜底
+    }
+
+    // 抖音注入：详情页 scope=null（全页找锚点）；信息流页逐 feed 项注入，
+    // 已注入过的项用 data 标记跳过（不能靠全局 ID 判断，feed 同时存在多个按钮）
+    function injectDouyin() {
+        const scopes = isDouyinFeed()
+            ? [...document.querySelectorAll('[data-e2e="feed-item"]')]
+            : [null];
+        let injected = 0;
+        for (const scope of scopes) {
+            const root = scope || document;
+            if (root.querySelector('[data-bili-dl-btn]')) continue; // 该项已有按钮
+            // 直播卡片（feed-live）没有可下载的作品，跳过
+            if (scope && scope.querySelector('[data-e2e="feed-live"]')) continue;
+            const anchor = findDouyinAnchor(scope);
+            if (!anchor) continue;
+            const btn = createButton();
+            btn.dataset.biliDlBtn = '1';
+            anchor.insertAdjacentElement('afterend', btn);
+            // 注入后校验：若命中隐藏副本（按钮 0×0）则撤掉
+            if (!isVisibleEl(btn)) {
+                btn.remove();
+                continue;
+            }
+            injected++;
+        }
+        if (injected) {
+            document.getElementById('bili-dl-ext-float')?.remove(); // 操作栏已渲染，撤掉浮动兜底
+            console.log(TAG, `已注入 ${injected} 个下载按钮到抖音操作栏`);
+        } else if (!scopes.length || scopes.some(s => s === null)) {
+            showFloatFallback(); // 信息流/操作栏未渲染时兜底
+        } else {
+            document.getElementById('bili-dl-ext-float')?.remove(); // feed 项存在但都是直播卡片，不兜底
+        }
     }
 
     // ---------- 数据获取（页面环境，带登录 Cookie） ----------
@@ -516,9 +545,12 @@
         const btn = e.currentTarget;
         closePanel();
         await withStatus(btn, async label => {
-            // 抖音：直接下载原画 MP4（免合并、无字幕/弹幕）
+            // 抖音：直接下载原画 MP4（免合并、无字幕/弹幕）。
+            // 信息流页把按钮所在 feed 项的位置带给后台，精确解析点击的那一条
             if (getPlatform() === 'douyin') {
-                const info = await getDouyinInfo();
+                const item = btn.closest('[data-e2e="feed-item"]');
+                const nearTop = item ? item.getBoundingClientRect().top : undefined;
+                const info = await getDouyinInfo(nearTop);
                 await downloadDouyin(info, label);
                 return;
             }
@@ -731,9 +763,9 @@
     // （经 background 的 scripting API 在 MAIN 世界读取）。
     // 页面打开即可用，无需先播放；带完整码率列表与图集信息。
     // 参考：douyin-dl-user-js 的 MediaHandler 同款机制。
-    function getDouyinAweme() {
+    function getDouyinAweme(nearTop) {
         return new Promise(resolve => {
-            chrome.runtime.sendMessage({ type: 'GET_DOUYIN_AWEME' }, resp => {
+            chrome.runtime.sendMessage({ type: 'GET_DOUYIN_AWEME', nearTop }, resp => {
                 if (chrome.runtime.lastError) return resolve(null);
                 resolve(resp?.ok ? resp.data : null);
             });
@@ -795,10 +827,12 @@
         return t || 'douyin_video';
     }
 
-    async function getDouyinInfo() {
-        // 策略0：播放器全局对象 awemeInfo（最强，见 buildInfoFromAweme）
+    async function getDouyinInfo(nearTop) {
+        const isFeed = isDouyinFeed();
+        // 策略0：播放器全局对象 awemeInfo / 信息流 feed 项 slideData（最强，见 buildInfoFromAweme）。
+        // nearTop：点击按钮所在 feed 项的视口位置，确保下载的是用户点的那一条
         try {
-            const fromAw = buildInfoFromAweme(await getDouyinAweme());
+            const fromAw = buildInfoFromAweme(await getDouyinAweme(nearTop));
             if (fromAw) return fromAw;
         } catch (e) {
             console.warn(TAG, 'awemeInfo 读取失败:', e.message);
@@ -819,6 +853,12 @@
             (resp?.urls || []).forEach(u => { if (!urls.includes(u)) urls.push(u); });
         } catch (e) {
             console.warn(TAG, '播放流捕获不可用:', e.message);
+        }
+
+        // 信息流页到此为止：RENDER_DATA/页面脚本里是"预加载的其他作品"，
+        // 无法归属到点击的那一项，继续解析会下载到错误视频——宁可不成功不可下错
+        if (isFeed && !urls.length) {
+            throw new Error('未能获取该作品的下载地址（可能是直播或暂不支持的类型），请滚动到具体视频后重试');
         }
 
         // 策略1：<script id="RENDER_DATA">（URL 编码的 SSR JSON，含 aweme_detail.video.play_addr）
@@ -1066,7 +1106,7 @@
                 lastUrl = location.href;
                 playCache.clear();
                 closePanel();
-                document.getElementById(BTN_ID)?.remove();
+                document.querySelectorAll('[data-bili-dl-btn]').forEach(b => b.remove());
                 document.getElementById('bili-dl-ext-float')?.remove();
             }
             injectButton();
@@ -1082,10 +1122,8 @@
         console.log(TAG, '内容脚本已加载 v' + chrome.runtime.getManifest().version + ':', location.href);
         injectButton();
         // 兜底轮询：抖音操作栏可能延迟很久才渲染（实测可达 1 分钟以上），
-        // 且期间 DOM 可能停止变动导致 MutationObserver 不再触发，定时重试保证真实按钮最终注入
-        setInterval(() => {
-            if (!document.getElementById(BTN_ID)) injectButton();
-        }, 3000);
+        // 且信息流上下滑会不断出现未注入的 feed 项，定时重试（injectButton 按项幂等）
+        setInterval(injectButton, 3000);
         setTimeout(() => {
             if (!document.getElementById(BTN_ID)) showFloatFallback();
         }, 8000);

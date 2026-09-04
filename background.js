@@ -31,32 +31,73 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         chrome.scripting.executeScript({
             target: { tabId },
             world: 'MAIN',
-            func: () => {
-                const info = window.player?.config?.awemeInfo;
-                if (!info) return null;
-                // 只取需要的字段，避免把巨型对象跨世界传回
-                const v = info.video || null;
-                return {
-                    awemeId: info.awemeId || '',
-                    desc: info.desc || '',
-                    author: info.authorInfo?.nickname || '',
-                    images: Array.isArray(info.images)
-                        ? info.images.map(im => (Array.isArray(im.url_list) ? im.url_list : []))
-                        : null,
-                    video: v ? {
-                        playApi: v.playApi || '',
-                        playApiH265: v.playApiH265 || '',
-                        bitRateList: (v.bitRateList || []).map(br => ({
-                            gearName: br.gearName || '',
-                            format: br.format || '',
-                            dataSize: br.dataSize || 0,
-                            width: br.width || 0,
-                            height: br.height || 0,
-                            playApi: br.playApi || '',
-                            playAddr: Array.isArray(br.playAddr) ? br.playAddr.map(a => a.src || '') : []
-                        }))
-                    } : null
+            args: [Number.isFinite(request.nearTop) ? request.nearTop : null],
+            func: (nearTop) => {
+                // 字段裁剪：awemeInfo 与 feed 项 slideData 同构，共用
+                const extract = (info) => {
+                    if (!info) return null;
+                    const v = info.video || null;
+                    return {
+                        awemeId: info.awemeId || '',
+                        desc: info.desc || '',
+                        author: info.authorInfo?.nickname || '',
+                        images: Array.isArray(info.images)
+                            ? info.images.map(im => (Array.isArray(im.url_list) ? im.url_list : []))
+                            : null,
+                        video: v ? {
+                            playApi: v.playApi || '',
+                            playApiH265: v.playApiH265 || '',
+                            bitRateList: (v.bitRateList || []).map(br => ({
+                                gearName: br.gearName || '',
+                                format: br.format || '',
+                                dataSize: br.dataSize || 0,
+                                width: br.width || 0,
+                                height: br.height || 0,
+                                playApi: br.playApi || '',
+                                playAddr: Array.isArray(br.playAddr) ? br.playAddr.map(a => a.src || '') : []
+                            }))
+                        } : null
+                    };
                 };
+                // 有可用媒体才返回（直播卡片 cellRoom 无 bitRateList/playAddr/images）
+                const usable = (info) => {
+                    if (!info) return null;
+                    const hasVideo = info.video && ((info.video.bitRateList || []).length || info.video.playApi || (info.video.playAddr || []).length);
+                    return (hasVideo || (info.images || []).length) ? extract(info) : null;
+                };
+
+                // 优先：详情页播放器全局对象（xg-video 注入的当前作品完整数据）
+                const fromPlayer = usable(window.player?.config?.awemeInfo);
+                if (fromPlayer) return fromPlayer;
+
+                // 回退：信息流页（推荐 /discover）没有 window.player，
+                // 作品数据挂在 feed 项的 React fiber slideData 上。
+                // nearTop：按钮所在 feed 项的视口 top，精确匹配点击的那个作品；
+                // 缺省取"矩形中心离视口中心最近"的项 = 当前正在播放的视频
+                const items = [...document.querySelectorAll('[data-e2e="feed-item"]')];
+                if (!items.length) return null;
+                const mid = nearTop !== null ? nearTop : innerHeight / 2;
+                items.sort((a, b) => {
+                    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                    const da = Math.abs(ra.top + ra.height / 2 - mid), db = Math.abs(rb.top + rb.height / 2 - mid);
+                    return da - db;
+                });
+                for (const el of items) {
+                    const fk = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+                    let f = fk ? el[fk] : null;
+                    let hops = 0;
+                    while (f && hops < 30) {
+                        const sd = f.memoizedProps?.slideData;
+                        if (sd) {
+                            const hit = usable(sd);
+                            if (hit) return hit;
+                            break; // 该项是直播/无媒体，不再向上翻
+                        }
+                        f = f.return;
+                        hops++;
+                    }
+                }
+                return null;
             }
         }, results => {
             void chrome.runtime.lastError;
