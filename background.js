@@ -18,6 +18,52 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         sendResponse({ ok: true, urls: [...new Set(list)].slice(0, 10) });
         return true;
     }
+    if (request.type === 'GET_DOUYIN_AWEME') {
+        // 直读抖音播放器全局对象 window.player.config.awemeInfo（MAIN 世界）。
+        // 这是 xg-video 播放器注入的当前作品完整数据：bitRateList 码率列表、图集 images、
+        // 标题/作者等，页面打开即可用，无需先播放（比 webRequest 被动捕获更强）。
+        // content script 在隔离世界拿不到 window.player，故经 background 用 scripting API 读取。
+        const tabId = _sender.tab?.id;
+        if (!tabId || tabId < 0) {
+            sendResponse({ ok: true, data: null });
+            return true;
+        }
+        chrome.scripting.executeScript({
+            target: { tabId },
+            world: 'MAIN',
+            func: () => {
+                const info = window.player?.config?.awemeInfo;
+                if (!info) return null;
+                // 只取需要的字段，避免把巨型对象跨世界传回
+                const v = info.video || null;
+                return {
+                    awemeId: info.awemeId || '',
+                    desc: info.desc || '',
+                    author: info.authorInfo?.nickname || '',
+                    images: Array.isArray(info.images)
+                        ? info.images.map(im => (Array.isArray(im.url_list) ? im.url_list : []))
+                        : null,
+                    video: v ? {
+                        playApi: v.playApi || '',
+                        playApiH265: v.playApiH265 || '',
+                        bitRateList: (v.bitRateList || []).map(br => ({
+                            gearName: br.gearName || '',
+                            format: br.format || '',
+                            dataSize: br.dataSize || 0,
+                            width: br.width || 0,
+                            height: br.height || 0,
+                            playApi: br.playApi || '',
+                            playAddr: Array.isArray(br.playAddr) ? br.playAddr.map(a => a.src || '') : []
+                        }))
+                    } : null
+                };
+            }
+        }, results => {
+            void chrome.runtime.lastError;
+            sendResponse({ ok: true, data: results?.[0]?.result ?? null });
+        });
+        return true;
+    }
     if (request.type === 'MERGE_JOB' && request.job) {
         // 任务交给合并页面：storage 传递 → 打开合并标签页
         chrome.storage.local.set({ mergeJob: request.job }, () => {
@@ -107,19 +153,26 @@ function stopKeepAlive() {
 async function downloadWithFailover(urls, filename) {
     activeJobs++;
     startKeepAlive();
+    const trace = [];
     try {
         const queue = urls.slice();
         while (queue.length) {
             const url = queue.shift();
             const started = await startDownload(url, filename);
-            if (!started.ok) continue; // 启动失败（无效地址等），换下一个
+            if (!started.ok) { trace.push({ url: url.slice(0, 80), err: 'start-failed' }); continue; }
 
             const result = await waitForDownload(started.id);
-            if (result === 'complete') return;
+            if (result === 'complete') {
+                chrome.storage.local.set({ lastDlTrace: { filename, ok: true, url: url.slice(0, 80) } }).catch(() => {});
+                return;
+            }
 
+            trace.push({ url: url.slice(0, 80), state: result });
             console.warn('[B站下载助手] 下载中断，尝试备用地址:', result, filename);
             chrome.downloads.erase({ id: started.id }).catch(() => {});
         }
+        trace.push({ err: 'all-failed' });
+        chrome.storage.local.set({ lastDlTrace: { filename, ok: false, trace } }).catch(() => {});
         console.error('[B站下载助手] 所有地址均下载失败:', filename);
     } finally {
         activeJobs--;

@@ -295,7 +295,7 @@
         if (getPlatform() === 'douyin') {
             // 抖音：竖排白色图标按钮，与点赞/评论/分享同列同风格
             btn.classList.add('bili-dl-ext-douyin');
-            btn.title = '下载当前视频（原画 MP4）';
+            btn.title = '下载当前作品（视频原画 MP4 / 图集）';
             btn.innerHTML = `
                 <svg viewBox="0 0 24 24"><path d="M12 3a1 1 0 0 1 1 1v9.59l3.3-3.3a1 1 0 1 1 1.4 1.42l-5 5a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.42l3.3 3.3V4a1 1 0 0 1 1-1zM5 19a1 1 0 0 1 1-1h12a1 1 0 1 1 0 2H6a1 1 0 0 1-1-1z"/></svg>
                 <span class="bili-dl-ext-text">下载</span>`;
@@ -725,7 +725,47 @@
         }
     }
 
-    // ---------- 抖音：解析 + 下载（单文件 MP4，无需合并） ----------
+    // ---------- 抖音：解析 + 下载 ----------
+
+    // 策略0（最强）：直读播放器全局对象 window.player.config.awemeInfo
+    // （经 background 的 scripting API 在 MAIN 世界读取）。
+    // 页面打开即可用，无需先播放；带完整码率列表与图集信息。
+    // 参考：douyin-dl-user-js 的 MediaHandler 同款机制。
+    function getDouyinAweme() {
+        return new Promise(resolve => {
+            chrome.runtime.sendMessage({ type: 'GET_DOUYIN_AWEME' }, resp => {
+                if (chrome.runtime.lastError) return resolve(null);
+                resolve(resp?.ok ? resp.data : null);
+            });
+        });
+    }
+
+    // 从 awemeInfo 构建下载信息：码率优选（跳过 dash，按文件体积降序 = 画质最高优先），
+    // H265 专线 playApiH265 与各码率 playAddr 作为回退；图集返回 images 二维 url 数组
+    function buildInfoFromAweme(aw) {
+        if (!aw) return null;
+        const urls = [];
+        if (aw.video) {
+            const brs = (aw.video.bitRateList || []).filter(br => br.format !== 'dash');
+            brs.sort((a, b) => (b.dataSize || 0) - (a.dataSize || 0));
+            for (const br of brs) {
+                if (br.playApi) urls.push(br.playApi);
+                for (const src of br.playAddr || []) if (src) urls.push(src);
+            }
+            if (aw.video.playApi) urls.push(aw.video.playApi);
+            if (aw.video.playApiH265) urls.push(aw.video.playApiH265);
+        }
+        const album = (aw.images || [])
+            .map(list => list.map(u => absoluteUrl(u)).filter(Boolean))
+            .filter(list => list.length);
+        if (!urls.length && !album.length) return null;
+        const title = [aw.author, aw.desc].filter(Boolean).join('_') || getDouyinTitle();
+        return {
+            title,
+            urls: [...new Set(urls)].slice(0, 10),
+            album: album.length ? album : null
+        };
+    }
 
     // 递归收集页面嵌入式数据中的 play_addr（每个含 url_list 数组）
     function collectDouyinPlayAddrs(obj) {
@@ -756,12 +796,19 @@
     }
 
     async function getDouyinInfo() {
-        const urls = [];
-        const title = getDouyinTitle();
+        // 策略0：播放器全局对象 awemeInfo（最强，见 buildInfoFromAweme）
+        try {
+            const fromAw = buildInfoFromAweme(await getDouyinAweme());
+            if (fromAw) return fromAw;
+        } catch (e) {
+            console.warn(TAG, 'awemeInfo 读取失败:', e.message);
+        }
 
-        // 策略0：后台 webRequest 捕获的本页真实播放直链（最可靠）。
+        // 策略1：后台 webRequest 捕获的本页真实播放直链。
         // 抖音页面是客户端渲染，RENDER_DATA 可能缺失、<video> 的 src 常为 blob:，
         // 脚本里不一定有 playAddr；浏览器实际拉流过的地址对 SPA/未登录全部免疫
+        const urls = [];
+        const title = getDouyinTitle();
         try {
             const resp = await new Promise((resolve, reject) => {
                 chrome.runtime.sendMessage({ type: 'GET_DOUYIN_STREAMS' }, resp => {
@@ -812,11 +859,20 @@
             });
         }
 
-        if (!urls.length) throw new Error('未能获取视频播放地址，请先播放视频几秒后再试（首次播放后扩展即可捕获直链）');
+        if (!urls.length) throw new Error('未能获取视频地址，请先播放视频几秒后再试（播放器数据不可用时扩展会捕获实际播放的直链）');
         return { title, urls };
     }
 
     async function downloadDouyin(info, label) {
+        // 图集：逐张下载（每张带多个 CDN 地址回退）
+        if (info.album) {
+            const n = info.album.length;
+            for (let i = 0; i < n; i++) {
+                await sendDownload(info.album[i], `${sanitize(info.title)}_${i + 1}of${n}.jpg`);
+            }
+            label.textContent = `已开始下载图集（${n} 张）✓`;
+            return;
+        }
         const name = sanitize(info.title) + '.mp4';
         await sendDownload(info.urls, name);
         label.textContent = '已开始下载抖音视频 ✓';
@@ -848,15 +904,23 @@
         }
         if (!document.getElementById(PANEL_ID)) return; // 面板已被关闭
 
-        // 抖音面板：单文件 MP4，无画质列表/字幕/弹幕
+        // 抖音面板：单文件 MP4 或图集，无画质列表/字幕/弹幕
         if (getPlatform() === 'douyin') {
-            panel.innerHTML = `
-                <div class="bili-dl-ext-panel-title">抖音下载</div>
-                <div class="bili-dl-ext-opt active" data-key="douyin-main">
+            const albumHtml = info.album
+                ? `<div class="bili-dl-ext-opt active" data-key="douyin-main">
+                    <span class="bili-dl-ext-qlabel">图集（${info.album.length} 张图片）</span>
+                    <span class="bili-dl-ext-qbadge">逐张下载</span>
+                </div>`
+                : `<div class="bili-dl-ext-opt active" data-key="douyin-main">
                     <span class="bili-dl-ext-qlabel">视频 MP4（原画）</span>
                     <span class="bili-dl-ext-qbadge">单文件</span>
-                </div>
-                <div class="bili-dl-ext-panel-tip">抖音视频为单文件 MP4，直接保存到下载目录。若获取失败请刷新页面重试。</div>`;
+                </div>`;
+            panel.innerHTML = `
+                <div class="bili-dl-ext-panel-title">抖音下载</div>
+                ${albumHtml}
+                <div class="bili-dl-ext-panel-tip">${info.album
+                    ? '检测到图集作品，将逐张保存全部图片。'
+                    : '抖音视频为单文件 MP4，直接保存到下载目录。若获取失败请刷新页面重试。'}</div>`;
             positionPanel(panel, btn);
             panel.addEventListener('click', e => {
                 const opt = e.target.closest('.bili-dl-ext-opt');
