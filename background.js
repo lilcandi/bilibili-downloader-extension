@@ -131,6 +131,8 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 // MV3 下 SW 空闲约 30 秒会被杀掉，异步注册的监听器会随 Promise 链一起丢失。
 // 解决：onChanged 监听在顶层同步注册；下载期间定时调用扩展 API 重置 SW 空闲计时器。
 
+console.log('[B站下载助手] SW loaded', new Date().toISOString());
+
 // ---------- 抖音播放流捕获 ----------
 // 抖音页面是客户端渲染：RENDER_DATA 可能缺失、<video> 的 src 常为 blob:，
 // 脚本里也不一定有 playAddr。唯一稳定的事实是"浏览器真实播放过的 CDN 直链"，
@@ -191,6 +193,59 @@ function stopKeepAlive() {
 }
 
 // 启动第一个可用地址；监控中断并依次切换备用地址（fire-and-forget）
+// 中断处理策略：
+//   - 有进度（>1MB）的中断 → 自动续传一次（B站 CDN 支持 Range，断流最常见，续传可救）
+//     续传仍失败 → 保留下载记录（列表可见、可手动续传），绝不静默删除
+//   - 零进度失败（403/地址过期等）→ 擦除记录换下一地址
+//   - 不可重试错误（磁盘满/拒绝访问/安全拦截）→ 立即终止，换地址没有意义
+const NON_RETRYABLE = new Set([
+    'FILE_ACCESS_DENIED', 'FILE_NO_SPACE', 'FILE_VIRUS_INFECTED', 'FILE_BLOCKED',
+    'FILE_TOO_LARGE', 'FILE_SLOTS_FULL', 'USER_CANCELED', 'USER_SHUTDOWN', 'CRASH'
+]);
+
+const PROGRESS_THRESHOLD = 1 << 20; // 1MB
+
+function getDownloadState(id) {
+    return new Promise(resolve => {
+        chrome.downloads.search({ id }, items => {
+            void chrome.runtime.lastError;
+            resolve(items?.[0] || null);
+        });
+    });
+}
+
+function tryResume(id) {
+    return new Promise(resolve => {
+        try {
+            chrome.downloads.resume(id, () => resolve(!chrome.runtime.lastError));
+        } catch (e) {
+            resolve(false);
+        }
+    });
+}
+
+// resume 后 Chromium 的状态翻转有延迟（事件监听可能读到过期终态），
+// 改用轮询等终态。返回前先等 3 秒让 in_progress 生效
+async function pollTerminal(id, maxMs = 10 * 60 * 1000) {
+    await new Promise(r => setTimeout(r, 3000));
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+        const st = await getDownloadState(id);
+        if (!st) return 'interrupted'; // 记录已消失
+        if (st.state === 'complete' || st.state === 'interrupted') return st.state;
+        await new Promise(r => setTimeout(r, 2000));
+    }
+    return 'timeout';
+}
+
+function flashBadge(text) {
+    try {
+        chrome.action.setBadgeBackgroundColor({ color: '#d63031' });
+        chrome.action.setBadgeText({ text });
+        setTimeout(() => chrome.action.setBadgeText({ text: '' }).catch(() => {}), 60000);
+    } catch (e) { /* 忽略 */ }
+}
+
 async function downloadWithFailover(urls, filename) {
     activeJobs++;
     startKeepAlive();
@@ -202,19 +257,39 @@ async function downloadWithFailover(urls, filename) {
             const started = await startDownload(url, filename);
             if (!started.ok) { trace.push({ url: url.slice(0, 80), err: 'start-failed' }); continue; }
 
-            const result = await waitForDownload(started.id);
+            let result = await waitForDownload(started.id);
+
+            if (result === 'interrupted') {
+                const st = await getDownloadState(started.id);
+                const reason = st?.interruptReason || '';
+                if (NON_RETRYABLE.has(reason)) {
+                    trace.push({ url: url.slice(0, 80), err: reason, bytes: st?.bytesReceived || 0 });
+                    chrome.storage.local.set({ lastDlTrace: { filename, ok: false, fatal: reason, trace } }).catch(() => {});
+                    flashBadge('!');
+                    console.error('[B站下载助手] 下载终止（', reason, '）:', filename, '— 已在扩展图标标记，请检查磁盘/安全软件');
+                    return;
+                }
+                // 有进度的中断先自动续传一次（CDN 断流最常见，B站 CDN 支持 Range）
+                if ((st?.bytesReceived || 0) > PROGRESS_THRESHOLD && await tryResume(started.id)) {
+                    console.warn('[B站下载助手] 下载中断（已收', Math.round((st?.bytesReceived || 0) / (1 << 20)), 'MB），自动续传:', reason, filename);
+                    result = await pollTerminal(started.id);
+                }
+            }
+
             if (result === 'complete') {
                 chrome.storage.local.set({ lastDlTrace: { filename, ok: true, url: url.slice(0, 80) } }).catch(() => {});
                 return;
             }
 
+            // 失败一律保留下载记录（下载列表可见、可手动重试/续传），绝不静默删除——
+            // 曾经的"中断即擦除"导致用户看到弹窗说已开始下载、列表却空空如也
             trace.push({ url: url.slice(0, 80), state: result });
-            console.warn('[B站下载助手] 下载中断，尝试备用地址:', result, filename);
-            chrome.downloads.erase({ id: started.id }).catch(() => {});
+            console.warn('[B站下载助手] 下载未完成（记录已保留，可手动续传），尝试备用地址:', result, filename);
         }
         trace.push({ err: 'all-failed' });
         chrome.storage.local.set({ lastDlTrace: { filename, ok: false, trace } }).catch(() => {});
-        console.error('[B站下载助手] 所有地址均下载失败:', filename);
+        flashBadge('!');
+        console.error('[B站下载助手] 所有地址均下载失败:', filename, JSON.stringify(trace));
     } finally {
         activeJobs--;
         if (activeJobs === 0) stopKeepAlive();

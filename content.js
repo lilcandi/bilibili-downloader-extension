@@ -594,7 +594,7 @@
             label.textContent = `已开始下载 ${qLabel} ✓`;
             saveExtras(info);
             alert(`「${qLabel}」体积约 ${fmtSize(video.bandwidth, info.timelength)}，超出浏览器内合并上限（约 600MB），
-已改为分别下载视频、音频两个文件，合并命令已复制到剪贴板（F12 控制台也可查看）。`);
+已改为分别下载视频、音频两个文件（进度见浏览器下载列表；中断会自动续传，失败会自动换备用地址），合并命令已复制到剪贴板（F12 控制台也可查看）。`);
             return;
         }
 
