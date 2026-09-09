@@ -92,5 +92,5 @@ MIT License
 
 ---
 
-**版本**: 1.6.2
+**版本**: 1.6.3
 **兼容浏览器**: Chrome/Edge (Manifest V3)
