@@ -2,9 +2,62 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>b抖下载器 - 流式下载</title>
+    <title>b抖下载器 · 下载进度</title>
+    <style>
+        :root { color-scheme: light; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+            background: #f7f8fa; color: #18191c; padding: 24px;
+            max-width: 720px; margin: 0 auto;
+        }
+        h1 { font-size: 18px; margin-bottom: 4px; }
+        .sub { color: #9499a0; font-size: 12px; margin-bottom: 20px; }
+        .job {
+            background: #fff; border-radius: 10px; padding: 16px 18px;
+            margin-bottom: 14px; box-shadow: 0 1px 4px rgba(0,0,0,.06);
+        }
+        .job .name { font-weight: 600; margin-bottom: 8px; word-break: break-all; }
+        .job .row { display: flex; justify-content: space-between; font-size: 12px; color: #61666d; margin-top: 6px; }
+        .bar { height: 8px; background: #e3e5e7; border-radius: 4px; overflow: hidden; }
+        .bar i { display: block; height: 100%; width: 0; background: #fb7299; border-radius: 4px; transition: width .3s; }
+        .job.done .bar i { background: #2ac864; }
+        .job.fail .bar i { background: #f05a5a; }
+        .status { font-weight: 600; }
+        .job.done .status { color: #2ac864; }
+        .job.fail .status { color: #f05a5a; }
+        .err { color: #f05a5a; font-size: 12px; margin-top: 6px; word-break: break-all; display: none; }
+        .job.fail .err { display: block; }
+        .empty { color: #9499a0; text-align: center; padding: 40px 0; }
+        .merge {
+            background: #fff; border-radius: 10px; padding: 16px 18px; margin-top: 20px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.06); display: none;
+        }
+        .merge .merge-title { font-weight: 600; margin-bottom: 4px; }
+        .merge .merge-tip { color: #9499a0; font-size: 12px; margin-bottom: 10px; }
+        .merge .merge-cmd {
+            font: 12px/1.6 Consolas, "Courier New", monospace;
+            background: #f1f2f3; border-radius: 8px; padding: 10px 12px;
+            word-break: break-all; color: #333; user-select: all;
+        }
+        .merge button {
+            margin-top: 10px; border: 0; border-radius: 8px; padding: 8px 18px;
+            background: #fb7299; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+        }
+        .merge button:hover { background: #fc8bab; }
+        .merge button:disabled { background: #2ac864; cursor: default; }
+    </style>
 </head>
 <body>
+    <h1>b抖下载器 · 下载进度</h1>
+    <div class="sub">大文件分块下载完成后会自动转入浏览器下载列表；全部完成后本页会自动关闭（失败时保留本页展示原因）。请勿关闭本页。</div>
+    <div id="jobs"><div class="empty">等待下载任务…</div></div>
+    <div id="merge" class="merge">
+        <div class="merge-title">ffmpeg 合并命令</div>
+        <div class="merge-tip">两个文件都下载完成后，在「下载」目录用命令提示符（cmd）粘贴执行；合并成功后自动删除两个原文件。不需要删原文件就去掉「&&」及之后的内容：</div>
+        <div class="merge-cmd" id="mergeCmd"></div>
+        <button id="copyBtn">一键复制合并命令</button>
+    </div>
     <script src="stream-dl.js"></script>
 </body>
 </html>

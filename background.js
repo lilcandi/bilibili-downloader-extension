@@ -2,9 +2,34 @@
 // 接收 content.js 解析好的直链（含备用地址），调用浏览器下载。
 // 启动成功立即响应；下载中断时在后台自动切换备用地址重试。
 
+// ---------- 批量下载完成通知（回传给发起页所在标签页） ----------
+// Chrome 限制：扩展页/背景的 runtime.sendMessage 不会送达内容脚本，必须用 tabs.sendMessage 定向转发。
+// 发起下载任务时记录 filename -> tabId，任务终态时通知该标签页（批量队列据此推进）。
+const noticeTabs = new Map(); // filename -> tabId
+const NOTICE_LIMIT = 200;
+
+function rememberNotice(filename, tabId) {
+    if (tabId == null || tabId < 0 || !filename) return;
+    if (noticeTabs.size > NOTICE_LIMIT) noticeTabs.clear();
+    noticeTabs.set(filename, tabId);
+}
+
+function notifyTab(filename, type, ok) {
+    const tabId = noticeTabs.get(filename);
+    if (tabId == null) return;
+    noticeTabs.delete(filename);
+    try { chrome.tabs.sendMessage(tabId, { type, filename, ok }).catch(() => { }); } catch (e) { /* 忽略 */ }
+}
+
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+    // 合并页/流式页报结果 → 转发给发起页（批量等待）
+    if ((request.type === 'MERGE_DONE' || request.type === 'DOWNLOAD_DONE') && request.filename) {
+        notifyTab(request.filename, request.type, !!request.ok);
+        return;
+    }
     if (request.type === 'DOWNLOAD_FILE' && Array.isArray(request.urls) && request.urls.length) {
-        downloadWithFailover(request.urls, request.filename);
+        rememberNotice(request.filename, _sender.tab?.id);
+        downloadWithFailover(request.urls, request.filename, request.mergeCmd, !!request.quiet);
         // 立即响应"已启动"，failover 在后台继续
         sendResponse({ ok: true, pending: true });
         return true;
@@ -107,8 +132,10 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     }
     if (request.type === 'MERGE_JOB' && request.job) {
         // 任务交给合并页面：storage 传递 → 打开合并标签页
+        rememberNotice(request.job.filename, _sender.tab?.id);
         chrome.storage.local.set({ mergeJob: request.job }, () => {
-            chrome.tabs.create({ url: chrome.runtime.getURL('merger.html') });
+            void chrome.runtime.lastError;
+            chrome.tabs.create({ url: chrome.runtime.getURL('merger.html'), active: !request.job.quiet });
             sendResponse({ ok: true });
         });
         return true;
@@ -238,6 +265,11 @@ async function pollTerminal(id, maxMs = 10 * 60 * 1000) {
     return 'timeout';
 }
 
+// upos 常规 CDN 强制校验 Referer，而 downloads 通道带不上 Referer（DNR 对其不生效），
+// 直连必 403，只会留下 0 字节的失败记录。只对不校验 Referer 的主机
+// （mcdn P2P 节点实测放行、非 upos 域名）先试 downloads 通道，其余直接交流式通道。
+const UPOS_LIKE = /^https:\/\/upos-[a-z0-9-]+\.(bilivideo\.com|bilivideo\.cn|akamaized\.net)(:\d+)?\//i;
+
 function flashBadge(text) {
     try {
         chrome.action.setBadgeBackgroundColor({ color: '#d63031' });
@@ -254,12 +286,14 @@ function flashBadge(text) {
 // 实测没有 chrome.downloads，无法完成最后的转存。
 let streamTabId = null;
 const opfsWaiters = new Map(); // filename -> resolve
+const streamResults = new Map(); // filename -> ok（本页批次结果，决定是否自动关页）
 let streamCloseTimer = null;
 
 chrome.runtime.onMessage.addListener(msg => {
     if (msg && msg.type === 'STREAM_DL_RESULT' && opfsWaiters.has(msg.filename)) {
         const finish = opfsWaiters.get(msg.filename);
         opfsWaiters.delete(msg.filename);
+        streamResults.set(msg.filename, !!msg.ok);
         finish(msg);
         scheduleStreamTabClose();
     }
@@ -277,15 +311,16 @@ async function pingStreamTab() {
     });
 }
 
-async function ensureStreamTab() {
+async function ensureStreamTab(quiet) {
     if (streamTabId != null) {
         if (await pingStreamTab()) return true;
         try { await chrome.tabs.remove(streamTabId); } catch (e) { /* 已关 */ }
         streamTabId = null;
     }
     try {
-        const tab = await chrome.tabs.create({ url: chrome.runtime.getURL('stream-dl.html'), active: false });
+        const tab = await chrome.tabs.create({ url: chrome.runtime.getURL('stream-dl.html'), active: !quiet });
         streamTabId = tab.id;
+        streamResults.clear();
         for (let i = 0; i < 40; i++) {
             if (await pingStreamTab()) return true;
             await new Promise(r => setTimeout(r, 250));
@@ -312,6 +347,8 @@ function scheduleStreamTabClose() {
     clearTimeout(streamCloseTimer);
     streamCloseTimer = setTimeout(async () => {
         if (opfsWaiters.size) return; // 还有并发任务在等
+        // 本批次任一任务失败 → 保留页面（用户需要在进度页看到失败原因），不自动关
+        if ([...streamResults.values()].some(ok => !ok)) return;
         const id = streamTabId;
         streamTabId = null;
         if (id != null) {
@@ -320,7 +357,9 @@ function scheduleStreamTabClose() {
     }, 10000);
 }
 
-function opfsFallback(urls, filename, timeoutMs = 30 * 60 * 1000) {
+function opfsFallback(urls, filename, mergeCmd, quiet, timeoutMs = 4 * 60 * 60 * 1000) {
+    // 超时只是安全网：真正的卡死判定在 stream-dl 页内（单 read 30s 卡死、整体 3 分钟
+    // 无进展、4 小时绝对上限），不再按固定总时长掐任务——慢速连接靠进度继续。
     return new Promise(async resolve => {
         let done = false;
         const finish = r => {
@@ -332,19 +371,19 @@ function opfsFallback(urls, filename, timeoutMs = 30 * 60 * 1000) {
         };
         const timer = setTimeout(() => finish({ ok: false, error: 'stream-timeout' }), timeoutMs);
         opfsWaiters.set(filename, finish);
-        if (!await ensureStreamTab()) return finish({ ok: false, error: 'stream-tab-unavailable' });
-        const ack = await sendToStreamTab({ type: 'STREAM_DL_START', urls, filename });
+        if (!await ensureStreamTab(quiet)) return finish({ ok: false, error: 'stream-tab-unavailable' });
+        const ack = await sendToStreamTab({ type: 'STREAM_DL_START', urls, filename, mergeCmd });
         if (!ack) finish({ ok: false, error: 'stream-tab-no-ack' });
     });
 }
 
-async function downloadWithFailover(urls, filename) {
+async function downloadWithFailover(urls, filename, mergeCmd, quiet) {
     activeJobs++;
     startKeepAlive();
     const trace = [];
     const zeroByteIds = []; // downloads 通道留下的 0 字节 403 残留记录，兜底成功后清理
     try {
-        const queue = urls.slice();
+        const queue = urls.filter(u => !UPOS_LIKE.test(u));
         while (queue.length) {
             const url = queue.shift();
             const started = await startDownload(url, filename);
@@ -360,6 +399,7 @@ async function downloadWithFailover(urls, filename) {
                     chrome.storage.local.set({ lastDlTrace: { filename, ok: false, fatal: reason, trace } }).catch(() => {});
                     flashBadge('!');
                     console.error('[B站下载助手] 下载终止（', reason, '）:', filename, '— 已在扩展图标标记，请检查磁盘/安全软件');
+                    chrome.runtime.sendMessage({ type: 'DOWNLOAD_DONE', filename, ok: false }).catch(() => {});
                     return;
                 }
                 // 有进度的中断先自动续传一次（CDN 断流最常见，B站 CDN 支持 Range）
@@ -371,6 +411,7 @@ async function downloadWithFailover(urls, filename) {
 
             if (result === 'complete') {
                 chrome.storage.local.set({ lastDlTrace: { filename, ok: true, url: url.slice(0, 80) } }).catch(() => {});
+                chrome.runtime.sendMessage({ type: 'DOWNLOAD_DONE', filename, ok: true }).catch(() => {});
                 return;
             }
 
@@ -385,7 +426,7 @@ async function downloadWithFailover(urls, filename) {
         // downloads 通道全部失败（最常见：常规 CDN 403 —— DNR Referer 注入对 downloads
         // 请求不生效）。切换后台标签页流式通道兜底（fetch 可携带 Referer，写 OPFS 不占内存）
         console.warn('[B站下载助手] downloads 通道全部失败，切换流式下载通道:', filename);
-        const r = await opfsFallback(urls, filename);
+        const r = await opfsFallback(urls, filename, mergeCmd, quiet);
         if (r && r.ok) {
             console.log('[B站下载助手] 流式下载完成:', filename);
             // 文件已完整落盘，顺手清掉 downloads 通道的 0 字节残留记录（避免列表里
@@ -394,11 +435,13 @@ async function downloadWithFailover(urls, filename) {
                 try { chrome.downloads.erase({ id }, () => void chrome.runtime.lastError); } catch (e) { /* 忽略 */ }
             }
             chrome.storage.local.set({ lastDlTrace: { filename, ok: true, via: 'opfs-stream' } }).catch(() => {});
+            chrome.runtime.sendMessage({ type: 'DOWNLOAD_DONE', filename, ok: true }).catch(() => {});
             return;
         }
 
         trace.push({ err: 'all-failed', stream: (r && r.error) || 'failed' });
         chrome.storage.local.set({ lastDlTrace: { filename, ok: false, trace } }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'DOWNLOAD_DONE', filename, ok: false }).catch(() => {});
         flashBadge('!');
         console.error('[B站下载助手] 所有地址均下载失败:', filename, JSON.stringify(trace));
     } finally {

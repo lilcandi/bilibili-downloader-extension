@@ -144,6 +144,13 @@
         }
         await ff.writeFile('in_video.mp4', videoData);
         await ff.writeFile('in_audio.m4a', audioData);
+        // 字幕封装（软字幕 mov_text 轨道，播放器可开关）：任务携带 base64 SRT 时写入
+        if (job.subtitle?.base64) {
+            const bin = atob(job.subtitle.base64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            await ff.writeFile('in_sub.srt', bytes);
+        }
         // 数据已写入 ffmpeg 的 MEMFS，释放 JS 侧引用，降低合并期间峰值内存
         videoData = audioData = null;
         ff.on('progress', ({ progress }) => {
@@ -151,22 +158,23 @@
                 setStep('merge', 'doing', `合并中 ${Math.round(progress * 100)}%`, progress);
             }
         });
-        setStep('merge', 'doing', '合并中…', null);
-        const code = await ff.exec([
-            '-i', 'in_video.mp4',
-            '-i', 'in_audio.m4a',
-            '-c', 'copy',
-            '-movflags', 'faststart',
-            'out.mp4'
-        ]);
+        setStep('merge', 'doing', job.subtitle ? '合并中（封装字幕）…' : '合并中…', null);
+        // 视频/音频流 -c copy 原样拷贝，字幕流单独转 mov_text（MP4 标准软字幕，几乎无额外耗时）
+        const args = ['-i', 'in_video.mp4', '-i', 'in_audio.m4a'];
+        if (job.subtitle?.base64) args.push('-i', 'in_sub.srt');
+        args.push('-c', 'copy');
+        if (job.subtitle?.base64) args.push('-c:s', 'mov_text', '-metadata:s:s:0', 'language=chi');
+        args.push('-movflags', 'faststart', 'out.mp4');
+        const code = await ff.exec(args);
         if (code !== 0) {
             throw new Error('合并失败（ffmpeg 退出码 ' + code + '），已保留两个原始文件可手动处理');
         }
         const merged = await ff.readFile('out.mp4');
         await ff.deleteFile('in_video.mp4');
         await ff.deleteFile('in_audio.m4a');
+        if (job.subtitle?.base64) await ff.deleteFile('in_sub.srt').catch(() => { });
         await ff.deleteFile('out.mp4');
-        setStep('merge', 'done', `完成 ${fmtMB(merged.length)}`, 1);
+        setStep('merge', 'done', `完成 ${fmtMB(merged.length)}${job.subtitle ? '（含字幕）' : ''}`, 1);
 
         // 4. 保存
         setStep('save', 'doing', '保存中…', null);
@@ -193,6 +201,10 @@
         });
         setStep('save', 'done', '已保存到下载目录', 1);
         $('closeBtn').style.display = 'inline-block';
+        // 批量下载等待信号：通知发起页本任务合并完成
+        try { chrome.runtime.sendMessage({ type: 'MERGE_DONE', filename: job.filename, ok: true }).catch(() => { }); } catch (e) { /* 忽略 */ }
+        // 批量（quiet）模式：成功后自动关页，避免一次下载几十集时标签页堆积
+        if (job.quiet) setTimeout(() => { try { window.close(); } catch (e) { } }, 1500);
     }
 
     async function main() {
@@ -214,6 +226,8 @@
                 if ($('st-' + s).classList.contains('doing')) setStep(s, 'fail', '失败');
             }
             $('closeBtn').style.display = 'inline-block';
+            // 批量下载等待信号：失败也要通知，避免发起页一直等
+            try { chrome.runtime.sendMessage({ type: 'MERGE_DONE', filename: job?.filename, ok: false }).catch(() => { }); } catch (e2) { /* 忽略 */ }
         }
     }
 

@@ -199,12 +199,83 @@
             accent-color: #fb7299;
             cursor: pointer;
         }
+        /* 合集/分P 选集区 */
+        #${PANEL_ID} .bili-dl-ext-batch {
+            border-top: 1px solid #f1f2f3;
+            margin-top: 4px;
+            padding-top: 6px;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 8px 6px;
+            font-size: 12px;
+            color: #61666d;
+            cursor: pointer;
+            user-select: none;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-head input { accent-color: #fb7299; cursor: pointer; }
+        #${PANEL_ID} .bili-dl-ext-batch-head .bili-dl-ext-batch-title {
+            flex: 1;
+            font-weight: 600;
+            color: #18191c;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-head .bili-dl-ext-batch-count {
+            color: #fb7299;
+            font-size: 11px;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-list {
+            max-height: 176px;
+            overflow-y: auto;
+            padding: 0 4px 4px;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 6px;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-item:hover { background: #f3f5f8; }
+        #${PANEL_ID} .bili-dl-ext-batch-item.cur { background: #fff5f8; }
+        #${PANEL_ID} .bili-dl-ext-batch-item input {
+            accent-color: #fb7299;
+            cursor: pointer;
+            flex: none;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-item .bili-dl-ext-bi-title {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-item .bili-dl-ext-bi-dur {
+            color: #9499a0;
+            font-size: 11px;
+            flex: none;
+        }
+        #${PANEL_ID} .bili-dl-ext-batch-item .bili-dl-ext-bi-cur {
+            color: #fb7299;
+            font-size: 11px;
+            flex: none;
+        }
     `;
 
     const QUALITY_LABEL = {
         127: '8K 超高清', 126: '杜比视界', 125: 'HDR 真彩', 120: '4K 超清',
         116: '1080P 60帧', 112: '1080P 高码率', 100: '智能修复', 80: '1080P 高清',
         74: '720P 60帧', 64: '720P 高清', 32: '480P 清晰', 16: '360P 流畅'
+    };
+
+    // 音质标签（与 AUDIO_RANK 对应；Hi-Res/杜比的 id 数值反而更小）
+    const AUDIO_LABEL = {
+        30251: 'Hi-Res 无损', 30250: '杜比全景声', 30280: '320K', 30232: '128K', 30216: '64K'
     };
 
     function injectStyle() {
@@ -411,20 +482,13 @@
         return data.data;
     }
 
-    async function getPlayInfo() {
-        const bvid = location.pathname.match(/BV[\w]+|av\d+/)?.[0];
-        if (!bvid) throw new Error('当前页面不是视频页');
-        const page = new URLSearchParams(location.search).get('p');
-
-        const info = await fetchJson(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`);
-        let cid = info.cid;
-        if (page && info.pages?.length) {
-            cid = (info.pages[page - 1] || info.pages[0]).cid;
-        }
-
+    // 用 bvid+cid 拉取 playurl 并组装下载信息（当前视频与合集/分P 批量下载共用）
+    async function buildPlayInfo({ bvid, cid, title, page, multiPage }) {
         if (playCache.has(cid)) {
             const cached = playCache.get(cid);
-            if (Date.now() - cached.fetchedAt < PLAY_CACHE_TTL) return cached;
+            if (Date.now() - cached.fetchedAt < PLAY_CACHE_TTL) {
+                return { ...cached, bvid, title: title || cached.title, page, multiPage: !!multiPage };
+            }
             playCache.delete(cid); // 直链临近过期，重新获取
         }
 
@@ -447,30 +511,133 @@
         // 不能按 id 数值排序：Hi-Res/杜比的 id 反而比 320K 小。
         // Hi-Res 在 dash.flac、杜比在 dash.dolby.audio，普通音质在 dash.audio。
         const AUDIO_RANK = { 30251: 50, 30250: 40, 30280: 30, 30232: 20, 30216: 10 };
-        const flac = play.dash?.flac;
-        const audio = [
-            ...(play.dash?.audio || []),
-            ...(play.dash?.dolby?.audio || []),
-            ...(Array.isArray(flac?.audio) ? flac.audio : flac ? [flac] : [])
+        // B站音频字段形态不一：dash.audio 为数组；dolby.audio 为数组或 null；
+        // flac 为 {display, audio}，其 audio 是单个对象（Hi-Res）或 null。统一归一化为数组，
+        // 避免把无 base_url 的包装对象误当音轨（曾导致大会员下载 Hi-Res 视频时音频流取错）
+        const asList = x => Array.isArray(x) ? x : x ? [x] : [];
+        // 全部候选音质按优先级排序（仅音频下载会逐条列出），audio 取最优一条
+        const audioList = [
+            ...asList(play.dash?.audio),
+            ...asList(play.dash?.dolby?.audio),
+            ...asList(play.dash?.flac?.audio)
         ].sort((a, b) =>
             (AUDIO_RANK[b.id] || b.id || 0) - (AUDIO_RANK[a.id] || a.id || 0) ||
             (b.bandwidth || 0) - (a.bandwidth || 0)
-        )[0] || null;
+        );
 
         const entry = {
             fetchedAt: Date.now(),
             bvid,
             cid,
-            title: info.title || 'Bilibili_Video',
+            title: title || 'Bilibili_Video',
             page,
-            multiPage: (info.pages?.length || 1) > 1,
+            multiPage: !!multiPage,
             timelength: play.timelength || 0,
             videoMap,
-            audio,
+            audio: audioList[0] || null,
+            audioList,
             durl: play.durl || null
         };
         playCache.set(cid, entry);
         return entry;
+    }
+
+    async function getPlayInfo() {
+        const bvid = location.pathname.match(/BV[\w]+|av\d+/)?.[0];
+        if (!bvid) throw new Error('当前页面不是视频页');
+        const page = new URLSearchParams(location.search).get('p');
+
+        const info = await fetchJson(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`);
+        let cid = info.cid;
+        if (page && info.pages?.length) {
+            cid = (info.pages[page - 1] || info.pages[0]).cid;
+        }
+
+        const entry = await buildPlayInfo({
+            bvid,
+            cid,
+            title: info.title || 'Bilibili_Video',
+            page,
+            multiPage: (info.pages?.length || 1) > 1
+        });
+        // 合集/分P 元信息（面板展示与批量下载用）
+        entry.pages = info.pages || null;
+        entry.ugcSeason = info.ugc_season || null;
+        return entry;
+    }
+
+    // 合集/分P 列表 → 批量候选项；无合集且非多P 时返回 null
+    function listBatchItems(info) {
+        const season = info.ugcSeason;
+        if (season?.sections?.length) {
+            const items = [];
+            for (const sec of season.sections) {
+                for (const ep of sec.episodes || []) {
+                    if (!ep?.bvid) continue;
+                    items.push({
+                        bvid: ep.bvid,
+                        cid: ep.cid || null,
+                        title: ep.title || ep.arc?.title || '视频',
+                        page: null,
+                        multiPage: false,
+                        duration: ep.arc?.duration || 0
+                    });
+                }
+            }
+            if (items.length) return { kind: 'season', title: season.title || '合集', items };
+        }
+        if (info.pages?.length > 1) {
+            return {
+                kind: 'pages',
+                title: '本视频分P',
+                items: info.pages.map(p => ({
+                    bvid: info.bvid,
+                    cid: p.cid,
+                    title: p.part || `P${p.page}`,
+                    page: p.page,
+                    multiPage: true,
+                    duration: p.duration || 0
+                }))
+            };
+        }
+        return null;
+    }
+
+    // 批量条目 → 下载信息（合集条目可能缺 cid，按 bvid 补查）
+    async function resolveBatchItem(it, key) {
+        let { cid, title } = it;
+        if (!cid) {
+            const view = await fetchJson(`https://api.bilibili.com/x/web-interface/view?bvid=${it.bvid}`);
+            cid = view.cid;
+            if (!title) title = view.title;
+        }
+        if (key === 'mp4') return { bvid: it.bvid, cid, title, page: it.page, multiPage: it.multiPage };
+        return buildPlayInfo({ bvid: it.bvid, cid, title, page: it.page, multiPage: it.multiPage });
+    }
+
+    // 批量下载（合集/分P）：逐个解析直链并按所选画质下载；串行 + 间隔，避免风控与多开合并
+    async function batchDownload(items, key, label) {
+        const total = items.length;
+        let ok = 0, fail = 0;
+        for (let i = 0; i < total; i++) {
+            const it = items[i];
+            const tag = `${it.page ? `P${it.page}` : it.title}`;
+            label.textContent = `批量 ${i + 1}/${total}：${tag.slice(0, 12)}`;
+            try {
+                console.log(TAG, `批量 [${i + 1}/${total}] 开始：${tag}`);
+                const info = await resolveBatchItem(it, key);
+                console.log(TAG, `批量 [${i + 1}/${total}] 解析完成：${tag}`, `画质数=${info.videoMap?.size || 0}`);
+                await executeChoice(key, info, label, { quiet: true, waitMerge: true });
+                console.log(TAG, `批量 [${i + 1}/${total}] 完成：${tag}`);
+                ok++;
+            } catch (e) {
+                fail++;
+                console.warn(TAG, `批量下载失败（${tag}）：`, e.message);
+            }
+            if (i < total - 1) await new Promise(r => setTimeout(r, 1200));
+        }
+        label.textContent = `批量完成 ${ok}/${total} ✓`;
+        if (fail) alert(`批量下载结束：成功 ${ok} 个，失败 ${fail} 个（失败详情见 F12 控制台）。`);
     }
 
     // ---------- 下载流程 ----------
@@ -490,11 +657,24 @@
     }
 
     // P2P/边缘节点（mcdn、第三方域名）在浏览器直连经常失败，
-    // 把常规 CDN 域名（bilivideo.com/.cn、akamaized）排到前面（允许带端口，如 mcdn 的 :8082）
-    const coveredHost = u => /^https:\/\/([\w-]+\.)*(bilivideo\.com|bilivideo\.cn|akamaized\.net)(:\d+)?\//.test(u);
+    // 候选顺序分三档：常规 https CDN（upos-*、akamaized）→ 其他 https 域名 →
+    // mcdn P2P 节点与非 https 地址（mcdn 不校验 Referer 但给长时间拉流容易卡死，垫底）。
+    // mcdn 虽被排后仍保留在列表里：downloads 通道与逐块重试轮换都会用到它。
+    const HOST_RE = /^https?:\/\/([^/]+)\//;
+    const regularHost = host => /(^|\.)upos-[a-z0-9-]+\.(bilivideo\.com|bilivideo\.cn|akamaized\.net)$/.test(host);
+    const mcdnHost = host => /(^|\.)mcdn\.(bilivideo\.com|bilivideo\.cn)$/.test(host);
+    function tierOf(u) {
+        const m = HOST_RE.exec(u);
+        if (!m) return 3;
+        const host = m[1].toLowerCase().split(':')[0]; // 去掉端口（mcdn 常带 :8082）
+        const https = u.startsWith('https:');
+        if (regularHost(host)) return https ? 0 : 2;
+        if (mcdnHost(host)) return https ? 2 : 3;
+        return https ? 1 : 3;
+    }
     function orderUrls(stream) {
         const urls = [stream.base_url, ...normalizeBackups(stream)];
-        return urls.sort((a, b) => (coveredHost(b) ? 1 : 0) - (coveredHost(a) ? 1 : 0));
+        return urls.sort((a, b) => tierOf(a) - tierOf(b));
     }
 
     function baseName(info, label) {
@@ -517,18 +697,28 @@
 
     let busy = false;
 
+    // B 站 SPA 常重渲染工具栏，把我们的按钮换成新元素（面板打开/鼠标交互期间很常见）。
+    // 长任务（批量下载）期间闭包里的 btn 可能已脱离 DOM，文字要写到"当前活着的按钮"上。
+    function liveLabelProxy(fallbackEl) {
+        const find = () => document.getElementById(BTN_ID)?.querySelector('.bili-dl-ext-text') || fallbackEl;
+        return {
+            get textContent() { return find().textContent; },
+            set textContent(v) { find().textContent = v; }
+        };
+    }
+
     async function withStatus(btn, fn) {
         if (busy) return;
         busy = true;
-        const label = btn.querySelector('.bili-dl-ext-text');
+        const label = liveLabelProxy(btn.querySelector('.bili-dl-ext-text'));
         const original = label.textContent;
         btn.disabled = true;
         try {
             label.textContent = '解析中…';
             await fn(label);
         } catch (err) {
-            console.error(TAG, err);
-            alert('下载失败：' + err.message);
+            console.error(TAG, '任务失败:', err && (err.stack || err.message || err));
+            try { alert('下载失败：' + (err && err.message || err)); } catch (e) { /* 忽略 */ }
             label.textContent = original;
         } finally {
             btn.disabled = false;
@@ -559,16 +749,55 @@
             if (!ids.length) return downloadMp4(info, label);
 
             let choice = getSavedChoice();
-            if (!choice || (choice.startsWith('dash:') && !info.videoMap.has(+choice.split(':')[1]))) {
+            if (!choice ||
+                (choice.startsWith('dash:') && !info.videoMap.has(+choice.split(':')[1])) ||
+                (choice.startsWith('audio:') && !(info.audioList || []).some(a => a.id === +choice.split(':')[1]))) {
                 choice = `dash:${ids[0]}`; // 默认/失效画质回退：最高可用
             }
             await executeChoice(choice, info, label);
         });
     }
 
-    async function executeChoice(key, info, label) {
+    // 等待合并标签页回报结果（批量下载用：等上一个合并完成再开下一个，避免多开占内存）
+    function waitMergeDone(filename, timeoutMs = 30 * 60 * 1000) {
+        return new Promise(resolve => {
+            const handler = msg => {
+                if (msg?.type === 'MERGE_DONE' && msg.filename === filename) {
+                    chrome.runtime.onMessage.removeListener(handler);
+                    clearTimeout(timer);
+                    resolve(!!msg.ok);
+                }
+            };
+            const timer = setTimeout(() => {
+                chrome.runtime.onMessage.removeListener(handler);
+                resolve(false); // 超时按失败处理，不阻塞后续条目
+            }, timeoutMs);
+            chrome.runtime.onMessage.addListener(handler);
+        });
+    }
+
+    // 等待某文件下载通道全部结束（双文件模式批量用；downloads 直连的完成不广播，故仅流式通道会收到）
+    function waitDownloadDone(filename, timeoutMs = 4 * 60 * 60 * 1000) {
+        return new Promise(resolve => {
+            const handler = msg => {
+                if (msg?.type === 'DOWNLOAD_DONE' && msg.filename === filename) {
+                    chrome.runtime.onMessage.removeListener(handler);
+                    clearTimeout(timer);
+                    resolve(!!msg.ok);
+                }
+            };
+            const timer = setTimeout(() => {
+                chrome.runtime.onMessage.removeListener(handler);
+                resolve(true); // 超时不再等（可能走的是 downloads 直连，无广播）
+            }, timeoutMs);
+            chrome.runtime.onMessage.addListener(handler);
+        });
+    }
+
+    async function executeChoice(key, info, label, { quiet = false, waitMerge = false } = {}) {
         saveChoice(key);
-        if (key === 'mp4') return downloadMp4(info, label);
+        if (key === 'mp4') return downloadMp4(info, label, quiet);
+        if (key.startsWith('audio')) return downloadAudioOnly(key, info, label, quiet);
 
         const qid = +key.split(':')[1];
         const video = info.videoMap.get(qid);
@@ -583,30 +812,48 @@
         // fetchStream 的 chunks + 拼接副本（2x），以及 ffmpeg MEMFS 中的输入+输出，
         // 实测 600MB 以上就可能 OOM，超过时自动回退为"分别下载两个文件 + ffmpeg 命令"
         const estBytes = ((video.bandwidth || 0) + (info.audio.bandwidth || 0)) / 8 * (info.timelength / 1000);
+        // 字幕/弹幕先行获取：勾选且获取成功才封装进视频，失败/无字幕自动退回不封装
+        const subtitle = await fetchSubtitleSrt(info);
+        const danmaku = await fetchDanmakuXml(info);
+
         if (estBytes > 600 * (1 << 20)) {
             const videoName = `${base}[仅视频].mp4`;
             const audioName = `${base}[仅音频].m4a`;
-            await sendDownload(orderUrls(video), videoName);
-            await sendDownload(orderUrls(info.audio), audioName);
-            const cmd = `ffmpeg -i "${videoName}" -i "${audioName}" -c copy "${mergedName}"`;
+            let cmd = `ffmpeg -i "${videoName}" -i "${audioName}"`;
+            if (subtitle) cmd += ` -i "${subtitle.filename}" -c:s mov_text -metadata:s:s:0 language=chi`;
+            cmd += ` -c copy "${mergedName}" && del "${videoName}" "${audioName}"`;
+            await sendDownload(orderUrls(video), videoName, cmd, quiet);
+            await sendDownload(orderUrls(info.audio), audioName, cmd, quiet);
+            saveExtrasData(subtitle, danmaku);
             console.log(TAG, 'ffmpeg 合并命令:\n' + cmd);
-            try { navigator.clipboard.writeText(cmd).catch(() => {}); } catch (e) { /* 忽略 */ }
-            label.textContent = `已开始下载 ${qLabel} ✓`;
-            saveExtras(info);
-            alert(`「${qLabel}」体积约 ${fmtSize(video.bandwidth, info.timelength)}，超出浏览器内合并上限（约 600MB），
-已改为分别下载视频、音频两个文件（进度见浏览器下载列表；中断会自动续传，失败会自动换备用地址），合并命令已复制到剪贴板（F12 控制台也可查看）。`);
+            if (!quiet) {
+                try { navigator.clipboard.writeText(cmd).catch(() => {}); } catch (e) { /* 忽略 */ }
+                label.textContent = `已开始下载 ${qLabel} ✓`;
+                alert(`「${qLabel}」体积约 ${fmtSize(video.bandwidth, info.timelength)}，超出浏览器内合并上限（约 600MB），
+已改为分别下载视频、音频两个文件（进度见弹出的下载进度页，完成后自动转入下载列表；中断会自动分块重试，失败会自动换备用地址）。下载进度页里有 ffmpeg 合并命令，可一键复制${subtitle ? '，合并成功后字幕会封装进视频' : ''}。`);
+            } else if (waitMerge) {
+                // 批量：等两个文件都下载完（流式通道会广播；downloads 直连无广播，超时兜底不阻塞）
+                await Promise.all([waitDownloadDone(videoName), waitDownloadDone(audioName)]);
+            }
             return;
         }
 
         // 默认：浏览器内合并（打开合并标签页，自动下载→合并→保存）
-        await sendMergeJob({
+        const job = {
             label: qLabel,
             filename: mergedName,
             video: { urls: orderUrls(video) },
             audio: { urls: orderUrls(info.audio) }
-        });
-        label.textContent = `合并下载已开始 ${qLabel} ✓`;
-        saveExtras(info);
+        };
+        if (subtitle) job.subtitle = { base64: utf8ToBase64(subtitle.srt) };
+        if (quiet) job.quiet = true;
+        await sendMergeJob(job);
+        saveExtrasData(subtitle, danmaku);
+        if (!quiet) label.textContent = `合并下载已开始 ${qLabel} ✓`;
+        if (waitMerge) {
+            const ok = await waitMergeDone(mergedName);
+            if (!ok) throw new Error('合并未完成或失败');
+        }
     }
 
     function sendMergeJob(job) {
@@ -623,7 +870,7 @@
     }
 
     // MP4 单文件模式（免合并，画质由 B 站 html5 接口决定，上限 720P/1080P）
-    async function downloadMp4(info, label) {
+    async function downloadMp4(info, label, quiet = false) {
         const play = await fetchJson(
             `https://api.bilibili.com/x/player/playurl?bvid=${info.bvid}&cid=${info.cid}` +
             `&qn=80&fnver=0&fnval=0&fourk=1&otype=json&type=mp4&platform=html5&high_quality=1`
@@ -638,13 +885,15 @@
             const name = `${base}${suffix}.mp4`;
             await sendDownload(orderUrls(segments[i]), name);
         }
-        label.textContent = `已开始下载 MP4 ${qLabel} ✓`;
-        saveExtras(info);
+        if (!quiet) {
+            label.textContent = `已开始下载 MP4 ${qLabel} ✓`;
+            saveExtras(info);
+        }
     }
 
-    function sendDownload(urls, filename) {
+    function sendDownload(urls, filename, mergeCmd, quiet) {
         return new Promise((resolve, reject) => {
-            chrome.runtime.sendMessage({ type: 'DOWNLOAD_FILE', urls, filename }, resp => {
+            chrome.runtime.sendMessage({ type: 'DOWNLOAD_FILE', urls, filename, mergeCmd, quiet }, resp => {
                 if (chrome.runtime.lastError) {
                     console.error(TAG, chrome.runtime.lastError.message);
                     return reject(new Error('无法连接扩展后台，请重新加载扩展'));
@@ -653,6 +902,19 @@
                 else reject(new Error(resp?.error || '浏览器下载启动失败'));
             });
         });
+    }
+
+    // 仅音频：直接保存选中的 DASH 音轨，免合并（B站音频流均为 fMP4 容器，统一存 .m4a）
+    async function downloadAudioOnly(key, info, label, quiet = false) {
+        const aid = key.startsWith('audio:') ? +key.split(':')[1] : null;
+        const audio = aid ? (info.audioList || []).find(a => a.id === aid) : info.audio;
+        if (!audio) throw new Error('未找到音频流');
+        const aLabel = AUDIO_LABEL[audio.id] || String(audio.id || '音频');
+        await sendDownload(orderUrls(audio), `${baseName(info, `${aLabel}音频`)}.m4a`);
+        if (!quiet) {
+            label.textContent = `已开始下载音频 ${aLabel} ✓`;
+            saveExtras(info); // 勾选的字幕/弹幕随音频一并保存（与 MP4 单文件模式一致）
+        }
     }
 
     // ---------- 字幕 / 弹幕附加保存 ----------
@@ -704,57 +966,80 @@
         ).join('\n\n') + '\n';
     }
 
-    async function downloadSubtitle(info, baseNameNoLabel) {
-        // player/wbi/v2 需登录 Cookie 才返回字幕列表，subtitle_url 有时效，需实时获取
-        const player = await fetchJson(
-            `https://api.bilibili.com/x/player/wbi/v2?bvid=${info.bvid}&cid=${info.cid}`
-        );
-        const subs = player?.subtitle?.subtitles || [];
-        if (!subs.length) {
-            console.warn(TAG, '该视频无可用字幕（未登录或未生成字幕）');
-            return;
-        }
-        // 优先中文轨道（ai-zh / zh-Hans / zh-CN），其次第一条
-        const zh = subs.find(s => /^zh/i.test(s.lan)) || subs[0];
-        let url = zh.subtitle_url || '';
-        if (!url) throw new Error('字幕地址为空');
-        if (url.startsWith('//')) url = 'https:' + url;
-
-        // 字幕 CDN 返回的是裸 JSON（{body:[...]}），没有 code/data 包装，不能用 fetchJson
-        const resp = await fetch(url, { credentials: 'include' });
-        if (!resp.ok) throw new Error('字幕接口 HTTP ' + resp.status);
-        const raw = await resp.json();
-        const sub = raw?.body ? raw : raw?.data;
-        if (!sub?.body?.length) throw new Error('字幕内容为空');
-        await saveTextFile(subtitleToSrt(sub.body), `${baseNameNoLabel}.srt`);
-        console.log(TAG, `字幕已保存：${zh.lan_doc}，共 ${sub.body.length} 条`);
-    }
-
-    async function downloadDanmaku(info, baseNameNoLabel) {
-        // 实时弹幕池（XML 格式，播放器/弹幕工具通用）；fetch 自动处理 deflate 解压
-        const resp = await fetch(`https://comment.bilibili.com/${info.cid}.xml`, { credentials: 'include' });
-        if (!resp.ok) throw new Error('弹幕接口 HTTP ' + resp.status);
-        const xml = await resp.text();
-        if (!/<d\s/.test(xml)) {
-            console.warn(TAG, '该视频弹幕池为空或弹幕已关闭');
-            return;
-        }
-        await saveTextFile(xml, `${baseNameNoLabel}.xml`);
-        const count = (xml.match(/<d\s/g) || []).length;
-        console.log(TAG, `弹幕已保存：共 ${count} 条`);
-    }
-
-    // 附加内容总入口：字幕/弹幕保存失败不影响主下载，仅在控制台提示
-    function saveExtras(info) {
+    // 获取字幕（不落盘，遵循偏好开关）：{ srt, filename } | null；失败不抛出，仅控制台提示
+    async function fetchSubtitleSrt(info) {
         const extras = getExtras();
-        if (!extras.subtitle && !extras.danmaku) return;
-        const base = baseName(info); // 不带画质标签，字幕/弹幕与画质无关
-        if (extras.subtitle) {
-            downloadSubtitle(info, base).catch(e => console.warn(TAG, '字幕保存失败：', e.message));
+        if (!extras.subtitle) return null;
+        try {
+            const base = baseName(info); // 不带画质标签，字幕与画质无关
+            // player/wbi/v2 需登录 Cookie 才返回字幕列表，subtitle_url 有时效，需实时获取
+            const player = await fetchJson(
+                `https://api.bilibili.com/x/player/wbi/v2?bvid=${info.bvid}&cid=${info.cid}`
+            );
+            const subs = player?.subtitle?.subtitles || [];
+            if (!subs.length) {
+                console.warn(TAG, '该视频无可用字幕（未登录或未生成字幕）');
+                return null;
+            }
+            // 优先中文轨道（ai-zh / zh-Hans / zh-CN），其次第一条
+            const zh = subs.find(s => /^zh/i.test(s.lan)) || subs[0];
+            let url = zh.subtitle_url || '';
+            if (!url) return null;
+            if (url.startsWith('//')) url = 'https:' + url;
+
+            // 字幕 CDN 返回的是裸 JSON（{body:[...]}），没有 code/data 包装，不能用 fetchJson
+            const resp = await fetch(url, { credentials: 'include' });
+            if (!resp.ok) throw new Error('字幕接口 HTTP ' + resp.status);
+            const raw = await resp.json();
+            const sub = raw?.body ? raw : raw?.data;
+            if (!sub?.body?.length) throw new Error('字幕内容为空');
+            console.log(TAG, `字幕已获取：${zh.lan_doc}，共 ${sub.body.length} 条`);
+            return { srt: subtitleToSrt(sub.body), filename: `${base}.srt` };
+        } catch (e) {
+            console.warn(TAG, '字幕获取失败：', e.message);
+            return null;
         }
-        if (extras.danmaku) {
-            downloadDanmaku(info, base).catch(e => console.warn(TAG, '弹幕保存失败：', e.message));
+    }
+
+    // 获取实时弹幕（不落盘，遵循偏好开关）：{ xml, filename } | null
+    async function fetchDanmakuXml(info) {
+        const extras = getExtras();
+        if (!extras.danmaku) return null;
+        try {
+            const base = baseName(info);
+            const resp = await fetch(`https://comment.bilibili.com/${info.cid}.xml`, { credentials: 'include' });
+            if (!resp.ok) throw new Error('弹幕接口 HTTP ' + resp.status);
+            const xml = await resp.text();
+            if (!/<d\s/.test(xml)) {
+                console.warn(TAG, '该视频弹幕池为空或弹幕已关闭');
+                return null;
+            }
+            console.log(TAG, `弹幕已获取：共 ${(xml.match(/<d\s/g) || []).length} 条`);
+            return { xml, filename: `${base}.xml` };
+        } catch (e) {
+            console.warn(TAG, '弹幕获取失败：', e.message);
+            return null;
         }
+    }
+
+    // 字幕/弹幕落盘（文本文件经后台 data URL 下载）；单边失败不影响另一边
+    function saveExtrasData(subtitle, danmaku) {
+        if (subtitle) {
+            saveTextFile(subtitle.srt, subtitle.filename)
+                .then(() => console.log(TAG, '字幕已保存：' + subtitle.filename))
+                .catch(e => console.warn(TAG, '字幕保存失败：', e.message));
+        }
+        if (danmaku) {
+            saveTextFile(danmaku.xml, danmaku.filename)
+                .then(() => console.log(TAG, '弹幕已保存：' + danmaku.filename))
+                .catch(e => console.warn(TAG, '弹幕保存失败：', e.message));
+        }
+    }
+
+    // 附加内容总入口（MP4 单文件模式等不做封装的场景）：现取现存，失败不影响主下载
+    function saveExtras(info) {
+        fetchSubtitleSrt(info).then(sub => sub && saveExtrasData(sub, null));
+        fetchDanmakuXml(info).then(d => d && saveExtrasData(null, d));
     }
 
     // ---------- 抖音：解析 + 下载 ----------
@@ -975,6 +1260,8 @@
         const ids = [...info.videoMap.keys()].sort((a, b) => b - a);
         const saved = getSavedChoice();
         const extras = getExtras();
+        const batch = listBatchItems(info);
+        const curPage = info.page ? +info.page : 1;
 
         let html = `<div class="bili-dl-ext-panel-title">选择画质</div>`;
         for (const id of ids) {
@@ -992,13 +1279,53 @@
             <div class="bili-dl-ext-opt${saved === 'mp4' ? ' active' : ''}" data-key="mp4">
                 <span class="bili-dl-ext-qlabel">MP4 单文件</span>
                 <span class="bili-dl-ext-qbadge">免合并</span>
-            </div>
+            </div>`;
+        // 仅音频：列出全部可用音质，直接保存 .m4a（DASH 无音轨的老视频自动不显示）
+        for (const a of info.audioList || []) {
+            const size = fmtSize(a.bandwidth, info.timelength);
+            const aLabel = AUDIO_LABEL[a.id] || `音轨 ${a.id}`;
+            html += `
+            <div class="bili-dl-ext-opt${saved === `audio:${a.id}` ? ' active' : ''}" data-key="audio:${a.id}">
+                <span class="bili-dl-ext-qlabel">仅音频 · ${aLabel}</span>
+                ${size ? `<span class="bili-dl-ext-qsize">${size}</span>` : ''}
+                <span class="bili-dl-ext-qbadge">M4A</span>
+            </div>`;
+        }
+        html += `
             <div class="bili-dl-ext-extras">
                 <span class="bili-dl-ext-extras-title">同时保存</span>
                 <label><input type="checkbox" data-extra="subtitle"${extras.subtitle ? ' checked' : ''}>字幕 .srt</label>
                 <label><input type="checkbox" data-extra="danmaku"${extras.danmaku ? ' checked' : ''}>弹幕 .xml</label>
-            </div>
-            <div class="bili-dl-ext-panel-tip">DASH 画质音视分离，超过 600MB 自动回退双文件下载；MP4 单文件上限 720P/1080P。字幕/弹幕随下载自动保存（字幕需登录）。</div>`;
+            </div>`;
+
+        // 合集/多P：选集区（勾选后点画质 = 批量下载勾选条目；不勾则只下当前 P）
+        if (batch) {
+            const label = batch.kind === 'season' ? '合集' : '分P';
+            html += `
+            <div class="bili-dl-ext-batch">
+                <div class="bili-dl-ext-batch-head" data-batch-toggle>
+                    <input type="checkbox" data-batch-all>
+                    <span class="bili-dl-ext-batch-title" title="${batch.title.replace(/"/g, '&quot;')}">${label}：${batch.title}</span>
+                    <span class="bili-dl-ext-batch-count">共 ${batch.items.length} 个</span>
+                </div>
+                <div class="bili-dl-ext-batch-list">`;
+            for (let i = 0; i < batch.items.length; i++) {
+                const it = batch.items[i];
+                const isCur = batch.kind === 'pages' && it.page === curPage;
+                const dur = it.duration ? `${Math.floor(it.duration / 60)}:${String(it.duration % 60).padStart(2, '0')}` : '';
+                const name = it.page ? `P${it.page} ${it.title}` : it.title;
+                html += `
+                    <label class="bili-dl-ext-batch-item${isCur ? ' cur' : ''}" title="${name.replace(/"/g, '&quot;')}">
+                        <input type="checkbox" data-batch-idx="${i}">
+                        <span class="bili-dl-ext-bi-title">${name}</span>
+                        ${isCur ? '<span class="bili-dl-ext-bi-cur">当前</span>' : ''}
+                        ${dur ? `<span class="bili-dl-ext-bi-dur">${dur}</span>` : ''}
+                    </label>`;
+            }
+            html += `</div></div>`;
+        }
+
+        html += `<div class="bili-dl-ext-panel-tip">DASH 画质音视分离，超过 600MB 自动回退双文件下载；MP4 单文件上限 720P/1080P；「仅音频」直接保存 .m4a 免合并。字幕/弹幕随下载自动保存（字幕需登录）。${batch ? ' 勾选多个选集后点画质 = 批量依次下载。' : ''}</div>`;
         panel.innerHTML = html;
         positionPanel(panel, btn);
 
@@ -1011,12 +1338,43 @@
             });
         });
 
+        // 选集：全选/单选联动
+        const allCb = panel.querySelector('[data-batch-all]');
+        const itemCbs = [...panel.querySelectorAll('[data-batch-idx]')];
+        const updateCount = () => {
+            if (!allCb) return;
+            const n = itemCbs.filter(c => c.checked).length;
+            allCb.checked = n > 0 && n === itemCbs.length;
+            allCb.indeterminate = n > 0 && n < itemCbs.length;
+            const cnt = panel.querySelector('.bili-dl-ext-batch-count');
+            if (cnt) cnt.textContent = n > 0 ? `已选 ${n}/${itemCbs.length}` : `共 ${itemCbs.length} 个`;
+        };
+        allCb?.addEventListener('change', () => {
+            itemCbs.forEach(c => { c.checked = allCb.checked; });
+            updateCount();
+        });
+        itemCbs.forEach(c => c.addEventListener('change', updateCount));
+
         panel.addEventListener('click', e => {
+            // 点选集标题行 = 全选/全不选（复选框自身由 change 处理，避免双重切换）
+            if (e.target.matches('input[data-batch-all]')) return;
+            if (e.target.closest('[data-batch-toggle]') && !e.target.closest('.bili-dl-ext-batch-list')) {
+                allCb.checked = !allCb.checked;
+                itemCbs.forEach(c => { c.checked = allCb.checked; });
+                updateCount();
+                return;
+            }
+            if (e.target.closest('.bili-dl-ext-batch-item')) return;
             const opt = e.target.closest('.bili-dl-ext-opt');
             if (!opt) return;
+            const selected = itemCbs.filter(c => c.checked).map(c => batch.items[+c.dataset.batchIdx]);
             closePanel();
-            withStatus(btn, async label => {
-                await executeChoice(opt.dataset.key, info, label);
+            withStatus(btn, async labelEl => {
+                if (selected.length) {
+                    await batchDownload(selected, opt.dataset.key, labelEl);
+                } else {
+                    await executeChoice(opt.dataset.key, info, labelEl);
+                }
             });
         });
 
